@@ -12,19 +12,22 @@ import { createOutput } from '../utils/index.js';
  */
 
 // Current proxy provider - UPDATE THIS WHEN PROXY MOVES
-// Source of truth: admin/infrastructure/deployments.ts
-const PROXY_PROVIDER = 'akash18ga02jzaq8cw52anyhzkwta5wygufgu6zsz6xc';
-const PROXY_PROVIDER_NAME = 'Europlots';
+// Source of truth: infrastructure-proxy/deployments.json
+// History:
+// - 2025-12-23: Europlots (IP pool exhausted on DigitalFrontier)
+// - 2026-01-30: DigitalFrontier (DSEQ 25312670, IP 77.76.13.213)
+const PROXY_PROVIDER = 'akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z';
+const PROXY_PROVIDER_NAME = 'DigitalFrontier';
 
 // Known providers with metadata
 const KNOWN_PROVIDERS: Record<string, { name: string; notes?: string }> = {
   'akash18ga02jzaq8cw52anyhzkwta5wygufgu6zsz6xc': {
     name: 'Europlots',
-    notes: 'Currently hosting SSL proxy - BLOCKED for services routing through proxy',
+    notes: 'Previously hosted SSL proxy, now available for services',
   },
   'akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z': {
     name: 'DigitalFrontier',
-    notes: 'IP pool exhausted as of 2025-12-23',
+    notes: 'Currently hosting SSL proxy (DSEQ 25312670, IP 77.76.13.213) - BLOCKED for backend services',
   },
   'akash1f6gmtjpx4r8qda9nxjwq26fp5mcjyqmaq5m6j7': {
     name: 'Subangle (GPU)',
