@@ -2,7 +2,7 @@ import { loadWalletAndClient } from '../src/utils/load-wallet.js';
 import { loadCertificate } from '../src/utils/load-certificate.js';
 import https from 'https';
 
-const DSEQ = 25397672; // Your new deployment
+const DSEQ = parseInt(process.argv[2] || '25411473');
 
 async function main() {
   console.log(`=== Getting Service URLs for DSEQ: ${DSEQ} ===\n`);

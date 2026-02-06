@@ -1,6 +1,6 @@
 import { loadWalletAndClient } from '../src/utils/load-wallet.js';
 
-const DSEQ = 25397588; // Your deployment to close
+const DSEQ = 25411246; // Failed manifest send (broken provider hostname)
 
 async function main() {
   console.log(`=== Closing Deployment DSEQ: ${DSEQ} ===\n`);

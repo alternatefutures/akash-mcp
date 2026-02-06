@@ -1,6 +1,6 @@
 import { loadWalletAndClient } from '../src/utils/load-wallet.js';
 
-const DSEQ = 25397672; // Your deployment
+const DSEQ = parseInt(process.argv[2] || '25411473'); // Default to service-cloud-api
 
 async function main() {
   console.log(`=== Checking Deployment DSEQ: ${DSEQ} ===\n`);
