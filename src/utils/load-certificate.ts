@@ -67,7 +67,29 @@ export async function loadCertificate(
 
   const certificatePath = path.resolve(certificatesDir, `${accounts[0].address}.json`);
 
-  // check to see if we can load the certificate
+  // Priority 1: Load from AKASH_CERT_JSON env var (for containers with ephemeral storage)
+  // This avoids on-chain revoke+regenerate on every container restart.
+  // Set this env var to the base64-encoded JSON cert file content.
+  const certEnv = process.env.AKASH_CERT_JSON;
+  if (certEnv) {
+    try {
+      const decoded = Buffer.from(certEnv, 'base64').toString('utf-8');
+      const cert = JSON.parse(decoded) as CertificatePem;
+      const normalized = {
+        cert: normalizePem(cert.cert),
+        publicKey: normalizePem(cert.publicKey),
+        privateKey: normalizePem(cert.privateKey),
+      };
+      // Persist to disk so subsequent loads (e.g. getToolContext) find it
+      fs.writeFileSync(certificatePath, JSON.stringify(normalized));
+      console.log('[loadCertificate] Loaded certificate from AKASH_CERT_JSON env var');
+      return normalized;
+    } catch (e: any) {
+      console.warn(`[loadCertificate] Failed to parse AKASH_CERT_JSON: ${e.message}`);
+    }
+  }
+
+  // Priority 2: Load from disk
   if (fs.existsSync(certificatePath)) {
     // Normalize line endings for mTLS compatibility
     const cert = JSON.parse(fs.readFileSync(certificatePath, 'utf8')) as CertificatePem;
@@ -78,7 +100,7 @@ export async function loadCertificate(
     };
   }
 
-  // if not, create a new one
+  // No local certificate found — generate a new one
   const certManager = new CertificateManager();
   const certificate = await certManager.generatePEM(accounts[0].address);
 
@@ -94,19 +116,17 @@ export async function loadCertificate(
       fs.writeFileSync(certificatePath, JSON.stringify(certificate));
       return certificate;
     } catch (error: any) {
-      // CRITICAL SECURITY/CORRECTNESS NOTE:
-      // If the chain rejects creation because a cert already exists, we MUST NOT
-      // persist and return this newly-generated cert. It will NOT match the
-      // on-chain cert, and mTLS with providers will fail (or behave inconsistently).
-      //
-      // In that case, the correct action is either:
-      // - keep using the existing local cert (if present), or
-      // - revoke existing on-chain cert(s) and regenerate (see regenerate-certificate tool).
+      // If a cert already exists on-chain but we don't have the local file (e.g. container
+      // restart with ephemeral storage), auto-recover by revoking and regenerating.
+      // This is essential for Akash deployments where the container storage is not persistent.
       if (error.message?.includes('certificate already exists')) {
-        throw new Error(
-          'Certificate already exists on-chain, but no local certificate file was found. ' +
-            'Refusing to save an unpublished cert. Run the regenerate-certificate tool (revokes + recreates), ' +
-            'or restore the existing local cert that matches the on-chain serial.'
+        console.warn(
+          '[loadCertificate] Certificate exists on-chain but no local file. Auto-regenerating...'
+        );
+        return await autoRegenerateCertificate(
+          accounts[0].address,
+          chainSDK,
+          certificatePath
         );
       }
       throw new Error(`Could not create certificate: ${error.message}`);
@@ -116,4 +136,60 @@ export async function loadCertificate(
   // Fallback: Just save locally without broadcasting (for when chainSDK is not ready)
   fs.writeFileSync(certificatePath, JSON.stringify(certificate));
   return certificate;
+}
+
+/**
+ * Auto-regenerate certificate when local file is lost but cert exists on-chain.
+ * Revokes all existing certs and creates a fresh one.
+ * This enables MCP to survive container restarts with ephemeral storage.
+ */
+async function autoRegenerateCertificate(
+  address: string,
+  chainSDK: ChainNodeSDK,
+  savePath: string
+): Promise<CertificatePem> {
+  // Step 1: Revoke all existing certificates
+  try {
+    const certsResponse = await chainSDK.akash.cert.v1.getCertificates({
+      filter: { owner: address, serial: '', state: 'valid' },
+      pagination: undefined,
+    });
+
+    const certificates = certsResponse.certificates || [];
+    for (const cert of certificates) {
+      const serial = cert.serial;
+      if (!serial) continue;
+      try {
+        await chainSDK.akash.cert.v1.revokeCertificate({
+          id: { owner: address, serial },
+        });
+        console.log(`[loadCertificate] Revoked certificate serial: ${serial}`);
+      } catch (revokeErr: any) {
+        console.warn(`[loadCertificate] Failed to revoke cert ${serial}: ${revokeErr.message}`);
+      }
+    }
+  } catch (queryErr: any) {
+    console.warn(`[loadCertificate] Failed to query certs for revocation: ${queryErr.message}`);
+  }
+
+  // Step 2: Generate and publish a fresh certificate
+  const certManager = new CertificateManager();
+  const newCert = await certManager.generatePEM(address);
+
+  try {
+    await chainSDK.akash.cert.v1.createCertificate({
+      owner: address,
+      cert: pemToUint8Array(newCert.cert),
+      pubkey: pemToUint8Array(newCert.publicKey),
+    });
+  } catch (createErr: any) {
+    throw new Error(
+      `Auto-regenerate failed: could not create new certificate after revoking old ones: ${createErr.message}`
+    );
+  }
+
+  // Step 3: Save to disk
+  fs.writeFileSync(savePath, JSON.stringify(newCert));
+  console.log('[loadCertificate] Auto-regenerated certificate successfully.');
+  return newCert;
 }

@@ -13,7 +13,7 @@
  *
  * Required:
  *   - akash-mcp/.env       (AKASH_MNEMONIC)
- *   - akash-mcp/.env.deploy (GHCR_PAT, JWT_SECRET, YSQL_PASSWORD, RESEND_API_KEY)
+ *   - akash-mcp/.env.deploy (GHCR_PAT, JWT_SECRET, YSQL_PASSWORD, RESEND_API_KEY, STRIPE_SECRET_KEY)
  */
 
 import path from 'path';
@@ -62,6 +62,8 @@ async function main() {
   const jwtSecret = mustEnv('JWT_SECRET');
   const ysqlPassword = mustEnv('YSQL_PASSWORD');
   const resendApiKey = mustEnv('RESEND_API_KEY');
+  const stripeSecretKey = optEnv('STRIPE_SECRET_KEY');
+  const openaiApiKey = optEnv('OPENAI_API_KEY');
   const jwtRefreshSecret = optEnv('JWT_REFRESH_SECRET', jwtSecret + '-refresh');
 
   // Database URL from DEPLOYMENTS.md
@@ -102,6 +104,10 @@ services:
       - JWT_SECRET=${jwtSecret}
       - JWT_REFRESH_SECRET=${jwtRefreshSecret}
       - RESEND_API_KEY=${resendApiKey}
+      # Payments (Stripe)
+      - STRIPE_SECRET_KEY=${stripeSecretKey}
+      # AI Proxy
+      - OPENAI_API_KEY=${openaiApiKey}
       # JWT Token Expiry
       - JWT_EXPIRES_IN=15m
       - JWT_REFRESH_EXPIRES_IN=7d

@@ -760,6 +760,8 @@ async function deployAuth(
   const jwtSecret = mustEnv('JWT_SECRET');
   const jwtRefreshSecret = optEnv('JWT_REFRESH_SECRET', jwtSecret + '-refresh');
   const resendApiKey = optEnv('RESEND_API_KEY');
+  const stripeSecretKey = optEnv('STRIPE_SECRET_KEY');
+  const openaiApiKey = optEnv('OPENAI_API_KEY');
 
   let sdlContent = mustReadFile(path.join(ROOT, 'service-auth/deploy-akash.yaml'));
 
@@ -781,7 +783,9 @@ async function deployAuth(
       `      # Secrets injected directly (Infisical skipped)\n` +
       `      - JWT_SECRET=${jwtSecret}\n` +
       `      - JWT_REFRESH_SECRET=${jwtRefreshSecret}\n` +
-      `      - RESEND_API_KEY=${resendApiKey}`
+      `      - RESEND_API_KEY=${resendApiKey}\n` +
+      `      - STRIPE_SECRET_KEY=${stripeSecretKey}\n` +
+      `      - OPENAI_API_KEY=${openaiApiKey}`
   );
 
   const triedProviders = new Set<string>();
@@ -850,6 +854,10 @@ async function deployApi(
   const arweaveWallet = optEnv('ARWEAVE_WALLET');
   const filecoinWalletKey = optEnv('FILECOIN_WALLET_KEY');
   const sentryDsn = optEnv('SENTRY_DSN', '');
+  const akashMnemonic = optEnv('AKASH_MNEMONIC');
+  const rpcEndpoint = optEnv('RPC_ENDPOINT', 'https://rpc.akashnet.net:443');
+  const grpcEndpoint = optEnv('GRPC_ENDPOINT', 'https://akash-grpc.publicnode.com:443');
+  const akashMcpPath = optEnv('AKASH_MCP_PATH', '/app/akash-mcp/dist/index.js');
 
   let sdlContent = mustReadFile(path.join(ROOT, 'service-cloud-api/deploy-api.yaml'));
   sdlContent = sdlContent.replace(/__DATABASE_URL__/g, databaseUrl);
@@ -862,6 +870,10 @@ async function deployApi(
   sdlContent = sdlContent.replace(/your_resend_api_key/g, resendApiKey);
   sdlContent = sdlContent.replace(/your_arweave_wallet/g, arweaveWallet);
   sdlContent = sdlContent.replace(/your_filecoin_wallet_key/g, filecoinWalletKey);
+  sdlContent = sdlContent.replace(/__AKASH_MNEMONIC__/g, akashMnemonic);
+  sdlContent = sdlContent.replace(/__RPC_ENDPOINT__/g, rpcEndpoint);
+  sdlContent = sdlContent.replace(/__GRPC_ENDPOINT__/g, grpcEndpoint);
+  sdlContent = sdlContent.replace(/__AKASH_MCP_PATH__/g, akashMcpPath);
   if (sentryDsn) {
     sdlContent = sdlContent.replace(/your_sentry_dsn/g, sentryDsn);
   }
@@ -1409,6 +1421,7 @@ async function main() {
     'YSQL_PASSWORD',
     'JWT_SECRET',
     'GHCR_PAT',
+    'AKASH_MNEMONIC',
   ];
 
   const missing = requiredVars.filter((v) => !process.env[v]);
