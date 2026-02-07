@@ -15,7 +15,16 @@ function pemToUint8Array(pem: string): Uint8Array {
 
 // Get the certificates directory path
 export function getCertificatesDir(): string {
-  return path.resolve(__dirname, './certificates');
+  // SECURITY:
+  // Never store private keys under `src/` (risk of accidental commit + publishing secrets).
+  // Use a local, gitignored directory at the package root instead.
+  //
+  // `__dirname` is either:
+  // - `.../akash-mcp/src/utils` during `tsx`
+  // - `.../akash-mcp/dist/utils` after build
+  // So `../..` consistently resolves to the `akash-mcp/` package root.
+  const pkgRoot = path.resolve(__dirname, '../..');
+  return path.resolve(pkgRoot, '.local/akash-certs');
 }
 
 // Get the certificate path for a specific address
@@ -85,10 +94,20 @@ export async function loadCertificate(
       fs.writeFileSync(certificatePath, JSON.stringify(certificate));
       return certificate;
     } catch (error: any) {
-      // Check if certificate already exists on chain
+      // CRITICAL SECURITY/CORRECTNESS NOTE:
+      // If the chain rejects creation because a cert already exists, we MUST NOT
+      // persist and return this newly-generated cert. It will NOT match the
+      // on-chain cert, and mTLS with providers will fail (or behave inconsistently).
+      //
+      // In that case, the correct action is either:
+      // - keep using the existing local cert (if present), or
+      // - revoke existing on-chain cert(s) and regenerate (see regenerate-certificate tool).
       if (error.message?.includes('certificate already exists')) {
-        fs.writeFileSync(certificatePath, JSON.stringify(certificate));
-        return certificate;
+        throw new Error(
+          'Certificate already exists on-chain, but no local certificate file was found. ' +
+            'Refusing to save an unpublished cert. Run the regenerate-certificate tool (revokes + recreates), ' +
+            'or restore the existing local cert that matches the on-chain serial.'
+        );
       }
       throw new Error(`Could not create certificate: ${error.message}`);
     }

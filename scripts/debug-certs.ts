@@ -79,7 +79,7 @@ async function main() {
 
   // Check local certificate
   console.log('\n=== Local Certificate ===\n');
-  const certPath = path.resolve(__dirname, '../dist/utils/certificates', `${address}.json`);
+  const certPath = path.resolve(__dirname, '../.local/akash-certs', `${address}.json`);
 
   if (fs.existsSync(certPath)) {
     const localCert = JSON.parse(fs.readFileSync(certPath, 'utf8'));

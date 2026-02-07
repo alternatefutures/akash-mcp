@@ -14,8 +14,10 @@ const PROVIDER_URI = 'provider.hurricane.akash.pub';
 const PROVIDER_PORT = 8443;
 
 async function main() {
-  const address = 'akash1degudmhf24auhfnqtn99mkja3xt7clt9um77tn';
-  const certPath = path.resolve(__dirname, '../dist/utils/certificates', `${address}.json`);
+  // Prefer passing your own address via env so this script stays reusable:
+  // CERT_ADDRESS=akash1... npx tsx scripts/test-mtls.ts
+  const address = process.env.CERT_ADDRESS || 'akash1degudmhf24auhfnqtn99mkja3xt7clt9um77tn';
+  const certPath = path.resolve(__dirname, '../.local/akash-certs', `${address}.json`);
 
   if (!fs.existsSync(certPath)) {
     console.error('Certificate file not found:', certPath);

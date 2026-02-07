@@ -1,6 +1,6 @@
 import { loadWalletAndClient } from '../src/utils/load-wallet.js';
 
-const DSEQ = 25411246; // Failed manifest send (broken provider hostname)
+const DSEQ = 25415866; // Yugabyte deployment on dcnorse (lease not found)
 
 async function main() {
   console.log(`=== Closing Deployment DSEQ: ${DSEQ} ===\n`);

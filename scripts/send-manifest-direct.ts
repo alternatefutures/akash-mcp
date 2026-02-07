@@ -124,7 +124,10 @@ async function main() {
   console.log('Provider:', providerHost);
 
   // Load certificate from file
-  const certPath = path.resolve(__dirname, '../dist/utils/certificates/akash1degudmhf24auhfnqtn99mkja3xt7clt9um77tn.json');
+  const certAddress = process.env.CERT_ADDRESS || 'akash1degudmhf24auhfnqtn99mkja3xt7clt9um77tn';
+  const certPath = process.env.CERT_PATH
+    ? path.resolve(process.env.CERT_PATH)
+    : path.resolve(__dirname, '../.local/akash-certs', `${certAddress}.json`);
   const certData = JSON.parse(fs.readFileSync(certPath, 'utf8'));
 
   console.log('\nCertificate loaded');

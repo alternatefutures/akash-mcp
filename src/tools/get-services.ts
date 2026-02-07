@@ -84,12 +84,13 @@ async function queryLeaseStatus(lease: CustomLease, providerUri: string, certifi
   });
 
   const uri = new URL(providerUri);
+  const port = uri.port ? parseInt(uri.port, 10) : 8443;
 
   return await new Promise<{ services: Record<string, { uris: string[] }> }>((resolve, reject) => {
     const req = https.request(
       {
         hostname: uri.hostname,
-        port: uri.port,
+        port,
         path: leasePath,
         method: 'GET',
         headers: {

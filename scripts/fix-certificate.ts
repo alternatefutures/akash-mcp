@@ -8,6 +8,7 @@ import { createStargateClient, createChainNodeSDK, CertificateManager } from '@a
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
+import { config } from 'dotenv';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -23,6 +24,9 @@ function normalizeLineEndings(pem: string): string {
 }
 
 async function main() {
+  // Load local env so this script can be run directly.
+  config({ path: path.resolve(__dirname, '../.env') });
+
   const mnemonic = process.env.AKASH_MNEMONIC;
   if (!mnemonic) {
     console.error('AKASH_MNEMONIC not set');
@@ -74,7 +78,7 @@ async function main() {
 
   // Step 2: Delete local certificate
   console.log('\n2. Deleting local certificate...');
-  const certPath = path.resolve(__dirname, '../dist/utils/certificates', `${address}.json`);
+  const certPath = path.resolve(__dirname, '../.local/akash-certs', `${address}.json`);
   if (fs.existsSync(certPath)) {
     fs.unlinkSync(certPath);
     console.log('   Deleted:', certPath);

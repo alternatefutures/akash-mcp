@@ -1,13 +1,9 @@
 import { z } from 'zod';
 import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { CertificateManager } from '@akashnetwork/chain-sdk';
 import type { ToolDefinition, ToolContext } from '../types/index.js';
 import { createOutput } from '../utils/create-output.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import { getCertificatePath, getCertificatesDir } from '../utils/load-certificate.js';
 
 // Helper to convert PEM string to Uint8Array
 function pemToUint8Array(pem: string): Uint8Array {
@@ -34,8 +30,8 @@ export const RegenerateCertificateTool: ToolDefinition<typeof parameters> = {
       }
 
       const address = accounts[0].address;
-      const certificatesDir = path.resolve(__dirname, '../utils/certificates');
-      const certificatePath = path.resolve(certificatesDir, `${address}.json`);
+      const certificatesDir = getCertificatesDir();
+      const certificatePath = getCertificatePath(address);
 
       // Step 1: Revoke ALL existing valid certificates on-chain first
       // This is critical - we must clear old certs before creating a new one

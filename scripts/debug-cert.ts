@@ -1,5 +1,9 @@
 import { createChainNodeSDK } from '@akashnetwork/chain-sdk';
 import * as fs from 'fs';
+import * as path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function debug() {
   const grpcEndpoint = 'https://akash-grpc.publicnode.com:443';
@@ -10,7 +14,7 @@ async function debug() {
     query: { baseUrl: grpcEndpoint },
   });
 
-  const address = 'akash1degudmhf24auhfnqtn99mkja3xt7clt9um77tn';
+  const address = process.env.CERT_ADDRESS || 'akash1degudmhf24auhfnqtn99mkja3xt7clt9um77tn';
 
   console.log('=== Querying certificates on chain ===\n');
 
@@ -43,7 +47,9 @@ async function debug() {
   }
 
   console.log('\n=== Local certificate ===\n');
-  const localCert = JSON.parse(fs.readFileSync('./dist/utils/certificates/akash1degudmhf24auhfnqtn99mkja3xt7clt9um77tn.json', 'utf8'));
+  const certPath = path.resolve(__dirname, '../.local/akash-certs', `${address}.json`);
+  const localCert = JSON.parse(fs.readFileSync(certPath, 'utf8'));
+  console.log('Path:', certPath);
   console.log('Local publicKey (first line):', localCert.publicKey.split('\n')[0]);
   console.log('Local publicKey full:\n', localCert.publicKey);
 }

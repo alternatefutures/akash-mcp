@@ -69,6 +69,7 @@ export async function sendManifest(sdl: SDL, lease: CustomLease, certificate: Ce
   const path = `/deployment/${dseq}/manifest`;
 
   const uri = new URL(providerInfo.hostUri);
+  const port = uri.port ? parseInt(uri.port, 10) : 8443;
 
   // Create HTTPS agent with mTLS credentials
   // IMPORTANT: Use a custom servername that doesn't match the provider's hostname
@@ -81,11 +82,11 @@ export async function sendManifest(sdl: SDL, lease: CustomLease, certificate: Ce
     servername: 'localhost',
   });
 
-  return await new Promise<void>((resolve, reject) => {
+  return await new Promise<string>((resolve, reject) => {
     const req = https.request(
       {
         hostname: uri.hostname,
-        port: uri.port,
+        port,
         path: path,
         method: 'PUT',
         headers: {
@@ -104,10 +105,17 @@ export async function sendManifest(sdl: SDL, lease: CustomLease, certificate: Ce
         });
 
         res.on('end', () => {
+          // IMPORTANT: Always log the response body.
+          // The provider may return 200 before async validation; if the manifest
+          // version hash mismatches, the provider silently drops it (no k8s resources).
+          if (responseBody && responseBody.trim().length > 0) {
+            console.log(`  [sendManifest] Response body (HTTP ${res.statusCode}): ${responseBody.trim()}`);
+          }
+
           if (res.statusCode !== 200) {
             return reject(new Error(`Could not send manifest: ${res.statusCode} - ${responseBody}`));
           }
-          resolve();
+          resolve(responseBody);
         });
       }
     );

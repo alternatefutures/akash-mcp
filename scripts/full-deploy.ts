@@ -134,7 +134,7 @@ async function main() {
   console.log('Owner:', address);
 
   // Load certificate
-  const certPath = path.resolve(__dirname, '../dist/utils/certificates', `${address}.json`);
+  const certPath = path.resolve(__dirname, '../.local/akash-certs', `${address}.json`);
   if (!fs.existsSync(certPath)) {
     console.error('Certificate not found! Run fix-certificate.ts first.');
     process.exit(1);
