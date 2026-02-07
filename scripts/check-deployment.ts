@@ -1,4 +1,10 @@
+import { config } from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { loadWalletAndClient } from '../src/utils/load-wallet.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+config({ path: path.resolve(__dirname, '../.env') });
 
 const DSEQ = parseInt(process.argv[2] || '25411473'); // Default to service-cloud-api
 

@@ -1,6 +1,7 @@
 dist/
 node_modules/
-.env
-.env.deploy
+.env*
+!.env.example
+!.env.*.example
 .DS_Store
 .local/
