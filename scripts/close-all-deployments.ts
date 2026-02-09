@@ -1,4 +1,11 @@
 import { loadWalletAndClient } from '../src/utils/load-wallet.js';
+import { config } from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+config({ path: path.resolve(__dirname, '../.env') });
+config({ path: path.resolve(__dirname, '../.env.deploy') });
 
 async function main() {
   console.log('=== Closing ALL Active Deployments ===\n');
@@ -34,24 +41,8 @@ async function main() {
 
       const dseq = Number(dep.id.dseq);
 
-      // Get lease info for logging
-      let providerInfo = '';
       try {
-        const leasesRes = await chainSDK.akash.market.v1beta5.getLeases({
-          filters: {
-            owner: address,
-            dseq: BigInt(dseq),
-          },
-        });
-        if (leasesRes.leases?.[0]?.lease?.id?.provider) {
-          providerInfo = ` (provider: ${leasesRes.leases[0].lease.id.provider})`;
-        }
-      } catch {
-        // ignore lease lookup errors
-      }
-
-      try {
-        console.log(`Closing DSEQ ${dseq}${providerInfo}...`);
+        console.log(`Closing DSEQ ${dseq}...`);
         await chainSDK.akash.deployment.v1beta4.closeDeployment({
           id: {
             owner: address,

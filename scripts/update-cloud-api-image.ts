@@ -24,9 +24,9 @@ const __dirname = path.dirname(__filename);
 config({ path: path.resolve(__dirname, '../.env') });
 config({ path: path.resolve(__dirname, '../.env.deploy') });
 
-// ─── Cloud API deployment info (from DEPLOYMENTS.md) ─────────────────────
-const API_DSEQ = 25424305;
-const API_PROVIDER = 'akash1v4mngfecem3xz0lqyr054na5g49andmyvnyykk';
+// ─── Cloud API deployment info (do not hardcode; pass in) ────────────────────
+const API_DSEQ = Number(process.env.API_DSEQ || '');
+const API_PROVIDER = process.env.API_PROVIDER || '';
 
 function mustEnv(key: string): string {
   const val = process.env[key];
@@ -47,13 +47,22 @@ async function main() {
   console.log('  UPDATE CLOUD API MANIFEST');
   console.log('========================================\n');
 
+  if (!API_DSEQ || !Number.isFinite(API_DSEQ) || !API_PROVIDER) {
+    throw new Error(
+      'Missing API_DSEQ / API_PROVIDER. Set them in the environment (see repo-root `.github/DEPLOYMENTS.md`).'
+    );
+  }
+
   const ghcrPat = mustEnv('GHCR_PAT');
   const jwtSecret = mustEnv('JWT_SECRET');
-  const ysqlPassword = mustEnv('YSQL_PASSWORD');
+  const databaseUrl = mustEnv('DATABASE_URL');
   const resendApiKey = optEnv('RESEND_API_KEY');
   const akashMnemonic = optEnv('AKASH_MNEMONIC');
   const rpcEndpoint = optEnv('RPC_ENDPOINT', 'https://rpc.akashnet.net:443');
   const grpcEndpoint = optEnv('GRPC_ENDPOINT', 'https://akash-grpc.publicnode.com:443');
+  const ipfsApiUrl = mustEnv('IPFS_API_URL');
+  const otelEndpoint = optEnv('OTEL_EXPORTER_OTLP_ENDPOINT', '');
+  const apiImage = optEnv('API_IMAGE', 'ghcr.io/alternatefutures/service-cloud-api:latest');
 
   // Load the local Akash certificate and base64-encode it for the container.
   // Without this, the MCP process inside the container fails because:
@@ -73,11 +82,10 @@ async function main() {
     console.warn('WARNING: No local Akash certificate found. MCP process may fail to start.');
   }
 
-  const databaseUrl = `postgresql://alternatefutures:${ysqlPassword}@provider.europlots.com:32648/alternatefutures`;
-
   console.log(`API DSEQ:       ${API_DSEQ}`);
   console.log(`API Provider:   ${API_PROVIDER}`);
-  console.log(`DATABASE_URL:   ${databaseUrl.substring(0, 40)}...`);
+  console.log(`DATABASE_URL:   ${databaseUrl.substring(0, 24)}...`);
+  console.log(`IPFS_API_URL:   ${ipfsApiUrl}`);
   console.log();
 
   // ─── Generate SDL (must match original profiles/placement/deployment) ────
@@ -86,7 +94,7 @@ version: "2.0"
 
 services:
   api:
-    image: ghcr.io/alternatefutures/service-cloud-api:fix3-amd64
+    image: ${apiImage}
     credentials:
       host: ghcr.io
       username: alternatefutures
@@ -103,8 +111,9 @@ services:
       - GRPC_ENDPOINT=${grpcEndpoint}
       - AKASH_MCP_PATH=/app/akash-mcp/dist/index.js
       - AKASH_CERT_JSON=${akashCertJson}
+      - IPFS_API_URL=${ipfsApiUrl}
       - IPFS_GATEWAY_URL=https://ipfs.alternatefutures.ai
-      - OTEL_EXPORTER_OTLP_ENDPOINT=
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${otelEndpoint}
       - OTEL_SERVICE_NAME=alternatefutures-api
     expose:
       - port: 4000

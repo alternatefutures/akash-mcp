@@ -13,7 +13,8 @@
  *
  * Required:
  *   - akash-mcp/.env       (AKASH_MNEMONIC)
- *   - akash-mcp/.env.deploy (GHCR_PAT, JWT_SECRET, YSQL_PASSWORD, RESEND_API_KEY, STRIPE_SECRET_KEY)
+ *   - akash-mcp/.env.deploy (GHCR_PAT, JWT_SECRET, DATABASE_URL, RESEND_API_KEY, STRIPE_SECRET_KEY)
+ *   - AUTH_DSEQ + AUTH_PROVIDER (set via env or inline before running; see repo-root `.github/DEPLOYMENTS.md`)
  */
 
 import path from 'path';
@@ -34,9 +35,9 @@ const __dirname = path.dirname(__filename);
 config({ path: path.resolve(__dirname, '../.env') });
 config({ path: path.resolve(__dirname, '../.env.deploy') });
 
-// ─── Auth deployment info (from DEPLOYMENTS.md) ────────────────────────────
-const AUTH_DSEQ = 25423184;
-const AUTH_PROVIDER = 'akash1xmjzu9dczlg9fa4v3pfvwzn7ty89r003laj4ac';
+// ─── Auth deployment info (do not hardcode; pass in) ─────────────────────────
+const AUTH_DSEQ = Number(process.env.AUTH_DSEQ || '');
+const AUTH_PROVIDER = process.env.AUTH_PROVIDER || '';
 
 function mustEnv(key: string): string {
   const val = process.env[key];
@@ -57,23 +58,28 @@ async function main() {
   console.log('  UPDATE AUTH SERVICE MANIFEST');
   console.log('========================================\n');
 
+  if (!AUTH_DSEQ || !Number.isFinite(AUTH_DSEQ) || !AUTH_PROVIDER) {
+    throw new Error(
+      'Missing AUTH_DSEQ / AUTH_PROVIDER. Set them in the environment (see repo-root `.github/DEPLOYMENTS.md`).'
+    );
+  }
+
   // Validate env vars
   const ghcrPat = mustEnv('GHCR_PAT');
   const jwtSecret = mustEnv('JWT_SECRET');
-  const ysqlPassword = mustEnv('YSQL_PASSWORD');
+  const databaseUrl = mustEnv('DATABASE_URL');
   const resendApiKey = mustEnv('RESEND_API_KEY');
   const stripeSecretKey = optEnv('STRIPE_SECRET_KEY');
   const openaiApiKey = optEnv('OPENAI_API_KEY');
   const jwtRefreshSecret = optEnv('JWT_REFRESH_SECRET', jwtSecret + '-refresh');
 
-  // Database URL from DEPLOYMENTS.md
-  const databaseUrl = `postgresql://alternatefutures:${ysqlPassword}@provider.europlots.com:32648/alternatefutures`;
-
   console.log(`Auth DSEQ:      ${AUTH_DSEQ}`);
   console.log(`Auth Provider:  ${AUTH_PROVIDER}`);
   console.log(`RESEND_API_KEY: ${resendApiKey.substring(0, 10)}...`);
-  console.log(`DATABASE_URL:   ${databaseUrl.substring(0, 40)}...`);
+  console.log(`DATABASE_URL:   ${databaseUrl.substring(0, 24)}...`);
   console.log();
+
+  const authImage = optEnv('AUTH_IMAGE', 'ghcr.io/alternatefutures/service-auth:latest');
 
   // ─── Generate SDL ──────────────────────────────────────────────────────────
   // This MUST match the original deployment's profiles/placement/deployment
@@ -83,7 +89,7 @@ version: "2.0"
 
 services:
   auth-api:
-    image: ghcr.io/alternatefutures/service-auth:latest
+    image: ${authImage}
     credentials:
       host: ghcr.io
       username: alternatefutures
@@ -275,10 +281,9 @@ deployment:
   console.log('========================================');
   console.log(`\nDSEQ:     ${AUTH_DSEQ} (unchanged)`);
   console.log(`Provider: ${AUTH_PROVIDER} (unchanged)`);
-  console.log(`Ingress:  o965f4gl25bip8ra8m1cuacij4.ingress.akash.tagus.host (unchanged)`);
   console.log(`\nRESEND_API_KEY is now injected. The container will restart with the new env vars.`);
   console.log(`Wait ~30s for the container to become healthy, then test:`);
-  console.log(`  curl -sf https://o965f4gl25bip8ra8m1cuacij4.ingress.akash.tagus.host/health`);
+  console.log(`  curl -sf https://auth.alternatefutures.ai/health`);
 }
 
 main().catch((e) => {

@@ -11,13 +11,14 @@ import { createOutput } from '../utils/index.js';
  * The proxy cannot reach services on its own provider's public ingress.
  */
 
-// Current proxy provider - UPDATE THIS WHEN PROXY MOVES
-// Source of truth: infrastructure-proxy/deployments.json
-// History:
-// - 2025-12-23: Europlots (IP pool exhausted on DigitalFrontier)
-// - 2026-01-30: DigitalFrontier (DSEQ 25312670, IP 77.76.13.213)
-const PROXY_PROVIDER = 'akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z';
-const PROXY_PROVIDER_NAME = 'DigitalFrontier';
+// Current proxy provider (avoid drift):
+// Override via env when the proxy moves:
+// - AKASH_SSL_PROXY_PROVIDER
+// - AKASH_SSL_PROXY_PROVIDER_NAME
+//
+// Source of truth: repo root `.github/DEPLOYMENTS.md` (and infrastructure-proxy/deployments.json)
+const PROXY_PROVIDER = process.env.AKASH_SSL_PROXY_PROVIDER || 'akash1zlsep362zz46qlwzttm06t8lv9qtg8gtaya97u';
+const PROXY_PROVIDER_NAME = process.env.AKASH_SSL_PROXY_PROVIDER_NAME || 'america.computer';
 
 // Known providers with metadata
 const KNOWN_PROVIDERS: Record<string, { name: string; notes?: string }> = {
@@ -27,7 +28,11 @@ const KNOWN_PROVIDERS: Record<string, { name: string; notes?: string }> = {
   },
   'akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z': {
     name: 'DigitalFrontier',
-    notes: 'Currently hosting SSL proxy (DSEQ 25312670, IP 77.76.13.213) - BLOCKED for backend services',
+    notes: 'Previously hosted SSL proxy - avoid if proxy is deployed here',
+  },
+  'akash1zlsep362zz46qlwzttm06t8lv9qtg8gtaya97u': {
+    name: 'america.computer',
+    notes: 'Hosts SSL proxy in current production (see repo-root deployment tracker)',
   },
   'akash1f6gmtjpx4r8qda9nxjwq26fp5mcjyqmaq5m6j7': {
     name: 'Subangle (GPU)',

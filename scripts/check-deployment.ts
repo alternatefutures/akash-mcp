@@ -6,9 +6,13 @@ import { loadWalletAndClient } from '../src/utils/load-wallet.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 config({ path: path.resolve(__dirname, '../.env') });
 
-const DSEQ = parseInt(process.argv[2] || '25411473'); // Default to service-cloud-api
+const DSEQ = parseInt(process.argv[2] || process.env.DSEQ || '', 10);
 
 async function main() {
+  if (!DSEQ || !Number.isFinite(DSEQ)) {
+    console.error('Usage: npx tsx scripts/check-deployment.ts <DSEQ>');
+    process.exit(1);
+  }
   console.log(`=== Checking Deployment DSEQ: ${DSEQ} ===\n`);
 
   try {

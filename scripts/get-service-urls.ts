@@ -2,14 +2,18 @@ import { loadWalletAndClient } from '../src/utils/load-wallet.js';
 import { loadCertificate } from '../src/utils/load-certificate.js';
 import https from 'https';
 
-const DSEQ = parseInt(process.argv[2] || '25411473');
+const DSEQ = parseInt(process.argv[2] || process.env.DSEQ || '', 10);
 
 async function main() {
+  if (!DSEQ || !Number.isFinite(DSEQ)) {
+    console.error('Usage: npx tsx scripts/get-service-urls.ts <DSEQ>');
+    process.exit(1);
+  }
   console.log(`=== Getting Service URLs for DSEQ: ${DSEQ} ===\n`);
 
   try {
-    const { wallet, chainSDK } = await loadWalletAndClient();
-    const certificate = await loadCertificate(wallet, chainSDK);
+    const { wallet, client, chainSDK } = await loadWalletAndClient();
+    const certificate = await loadCertificate(wallet, client, chainSDK);
     const accounts = await wallet.getAccounts();
     const address = accounts[0].address;
 

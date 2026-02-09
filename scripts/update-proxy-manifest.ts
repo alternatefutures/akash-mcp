@@ -33,9 +33,9 @@ const ROOT = path.resolve(__dirname, '../..');
 config({ path: path.resolve(__dirname, '../.env') });
 config({ path: path.resolve(__dirname, '../.env.deploy') });
 
-// ─── Proxy deployment info (from DEPLOYMENTS.md) ────────────────────────────
-const PROXY_DSEQ = 25423216;
-const PROXY_PROVIDER = 'akash1zlsep362zz46qlwzttm06t8lv9qtg8gtaya97u';
+// ─── Proxy deployment info (do not hardcode; pass in) ────────────────────────
+const PROXY_DSEQ = Number(process.env.PROXY_DSEQ || '');
+const PROXY_PROVIDER = process.env.PROXY_PROVIDER || '';
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -55,6 +55,12 @@ async function main() {
   console.log('  UPDATE SSL PROXY MANIFEST');
   console.log('========================================\n');
 
+  if (!PROXY_DSEQ || !Number.isFinite(PROXY_DSEQ) || !PROXY_PROVIDER) {
+    throw new Error(
+      'Missing PROXY_DSEQ / PROXY_PROVIDER. Set them in the environment (see repo-root `.github/DEPLOYMENTS.md`).'
+    );
+  }
+
   // Read TLS certificates
   const certFile = path.join(ROOT, 'infrastructure-proxy/certs/origin.crt');
   const keyFile = path.join(ROOT, 'infrastructure-proxy/certs/origin.key');
@@ -68,9 +74,11 @@ async function main() {
 
   const ghcrPat = process.env.GHCR_PAT || '';
   if (!ghcrPat) console.warn('WARNING: GHCR_PAT not set — image pull may fail if private');
+  const proxyImage = process.env.PROXY_IMAGE || 'ghcr.io/alternatefutures/infrastructure-proxy-pingap:main';
 
   console.log(`Proxy DSEQ:     ${PROXY_DSEQ}`);
   console.log(`Proxy Provider: ${PROXY_PROVIDER}`);
+  console.log(`Proxy Image:    ${proxyImage}`);
   console.log(`TLS Cert:       ${certFile} (${originCert.split('\n').length} lines)`);
   console.log();
 
@@ -87,7 +95,7 @@ endpoints:
 
 services:
   ssl-proxy:
-    image: ghcr.io/alternatefutures/infrastructure-proxy-pingap:db616d1
+    image: ${proxyImage}
     credentials:
       host: ghcr.io
       username: alternatefutures
@@ -230,10 +238,9 @@ deployment:
   console.log('========================================');
   console.log(`\nDSEQ:     ${PROXY_DSEQ} (unchanged)`);
   console.log(`Provider: ${PROXY_PROVIDER} (unchanged)`);
-  console.log(`IP:       198.12.74.90 (unchanged)`);
-  console.log(`\nThe container will restart and pull the latest :main image.`);
+  console.log(`\nThe container will restart and pull the configured proxy image tag.`);
   console.log(`Wait ~60s for the proxy to become healthy, then test:`);
-  console.log(`  curl -sf --resolve auth.alternatefutures.ai:443:198.12.74.90 https://auth.alternatefutures.ai/health`);
+  console.log(`  curl -sf https://auth.alternatefutures.ai/health`);
 }
 
 main().catch((e) => {

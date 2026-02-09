@@ -10,10 +10,15 @@ config({ path: path.resolve(__dirname, '../.env') });
 import { loadWalletAndClient } from '../src/utils/load-wallet.js';
 import { loadCertificate } from '../src/utils/load-certificate.js';
 
-const DSEQ = 25423216;
-const PROVIDER = 'akash1zlsep362zz46qlwzttm06t8lv9qtg8gtaya97u';
+const DSEQ = Number(process.env.PROXY_DSEQ || process.env.DSEQ || '');
+const PROVIDER = process.env.PROXY_PROVIDER || process.env.PROVIDER || '';
 
 async function main() {
+  if (!DSEQ || !Number.isFinite(DSEQ) || !PROVIDER) {
+    throw new Error(
+      'Missing PROXY_DSEQ/DSEQ and/or PROXY_PROVIDER/PROVIDER. Set them in the environment (see repo-root `.github/DEPLOYMENTS.md`).'
+    );
+  }
   const { wallet, client, chainSDK } = await loadWalletAndClient();
   const certificate = await loadCertificate(wallet, client, chainSDK);
   const providerRes = await chainSDK.akash.provider.v1beta4.getProvider({ owner: PROVIDER });

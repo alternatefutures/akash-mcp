@@ -5,7 +5,7 @@
  * Deployment order (each depends on the previous):
  *   1. Close all active deployments
  *   2. Deploy PostgreSQL (standalone)
- *   3. Deploy data services (IPFS + Jaeger + OTel)
+ *   3. Deploy data services (IPFS + Jaeger)
  *   4. Deploy auth (standalone, with DATABASE_URL + secrets injected via env vars)
  *   5. Deploy API (standalone)
  *   6. Deploy SSL proxy (Pingap with dedicated IP lease)
@@ -18,7 +18,9 @@
  * Required:
  *   - akash-mcp/.env       (AKASH_MNEMONIC)
  *   - akash-mcp/.env.deploy (all deployment secrets - see .env.deploy.example)
- *   - infrastructure-proxy/certs/origin.crt + origin.key (Cloudflare Origin Certificate)
+ *   - SSL proxy TLS material (Cloudflare Origin Certificate + key), provided via:
+ *     - env: PINGAP_TLS_CERT + PINGAP_TLS_KEY (recommended for open source), OR
+ *     - local files: infrastructure-proxy/certs/origin.crt + origin.key
  *
  * Usage:
  *   cd akash-mcp && npx tsx scripts/redeploy-all.ts
@@ -27,6 +29,7 @@
 import fs from 'fs';
 import path from 'path';
 import https from 'https';
+import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { config } from 'dotenv';
 import { SDL } from '@akashnetwork/chain-sdk';
@@ -35,6 +38,7 @@ import { loadWalletAndClient } from '../src/utils/load-wallet.js';
 import { loadCertificate } from '../src/utils/load-certificate.js';
 import { sendManifest } from '../src/tools/send-manifest.js';
 import { hasProviderServicesCli, sendManifestCli } from '../src/utils/send-manifest-cli.js';
+import { getFailingProvidersForService, getKnownWorkingProvidersForService, recordProviderResult } from '../src/utils/provider-registry.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -44,6 +48,25 @@ const ROOT = path.resolve(__dirname, '../..');
 config({ path: path.resolve(__dirname, '../.env') });
 config({ path: path.resolve(__dirname, '../.env.deploy') });
 
+// Optional local telemetry (gitignored): record all bids seen per service so we
+// can later compare "cheapest" across providers even when we didn’t select them.
+const PROVIDER_BIDS_LOG_PATH =
+  process.env.AKASH_PROVIDER_BIDS_LOG_PATH || path.resolve(__dirname, '../.local/provider-bids.jsonl');
+
+function appendBidsLog(entry: any) {
+  try {
+    fs.mkdirSync(path.dirname(PROVIDER_BIDS_LOG_PATH), { recursive: true });
+    fs.appendFileSync(PROVIDER_BIDS_LOG_PATH, JSON.stringify(entry) + '\n');
+  } catch {
+    // best-effort; never block deployments
+  }
+}
+
+// ─── Run state (for cleanup + provider registry) ────────────────────────────
+let RUN_OWNER: string | null = null;
+let RUN_CHAIN_SDK: any = null;
+const RUN_CREATED_DSEQS = new Set<number>();
+
 // ─── Known-bad providers ────────────────────────────────────────────────────
 const ALWAYS_EXCLUDE = new Set([
   'akash1smapjx8m8363nmdvc2yr9atlqy8vcql73m9l0v', // Broken hostname
@@ -51,6 +74,7 @@ const ALWAYS_EXCLUDE = new Set([
   'akash1rr5pzy4kz2wwwtntt5vz4as0afw0ljrfmhty8q', // No named storage vol support - only created 2/8 services
   'akash1vg3gk6dynh9ys45tzjyedp0dl52s93kap75x3n', // zanthem.cloud - creates 2/8 svcs then loses lease
   'akash1tweev0k42guyv3a2jtgphmgfrl2h5y2884vh9d', // dcnorse.eu - lease not found after manifest
+  'akash1qmumr9mdnu9e8ymyr3nnf3qyjfkugj79eh6jzq', // yggdrasil-compute.com - broken DNS: provider.provider.yggdrasil-compute.com (doubled prefix)
   'akash1sjwuwre4qprcaa34f6324yz7m8nn0awvc75gp5', // quanglong.org - repeated kube: lease not found after manifest
   // leet.haus — was excluded for persistent "kube: lease not found" but that
   // was caused by missing persistent storage attributes in the SDL (now fixed).
@@ -71,8 +95,8 @@ const LEASE_NOT_FOUND_FAILFAST = 6;
 
 // ─── CLI availability (set during init) ──────────────────────────────────────
 // When true, we shell out to `provider-services send-manifest` instead of
-// using the JS SDK's `sendManifest()`.  This avoids the canonical-JSON hash
-// mismatch between the JS SDK and the Go provider binary.
+// using the JS SDK's `sendManifest()`. This mirrors the CI/CD path and can be
+// more operationally reliable on some providers.
 let USE_CLI_MANIFEST = false;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -101,6 +125,16 @@ function optEnv(key: string, fallback = 'placeholder'): string {
   return process.env[key] || fallback;
 }
 
+function mustDbPassword(): string {
+  const val = process.env.POSTGRES_PASSWORD || process.env.YSQL_PASSWORD;
+  if (!val) {
+    throw new Error(
+      'Missing required env var: POSTGRES_PASSWORD (preferred) or YSQL_PASSWORD (deprecated alias) (set it in .env.deploy)'
+    );
+  }
+  return val;
+}
+
 async function closeDeploymentQuiet(chainSDK: any, owner: string, dseq: number, label: string) {
   try {
     await chainSDK.akash.deployment.v1beta4.closeDeployment({
@@ -109,6 +143,17 @@ async function closeDeploymentQuiet(chainSDK: any, owner: string, dseq: number, 
     console.log(`  [${label}] Closed DSEQ ${dseq}`);
   } catch (e: any) {
     console.log(`  [${label}] Warning: Failed to close DSEQ ${dseq}: ${e.message || e}`);
+  }
+}
+
+async function cleanupRunDeployments(label = 'cleanup') {
+  if (!RUN_CHAIN_SDK || !RUN_OWNER) return;
+  if (RUN_CREATED_DSEQS.size === 0) return;
+  console.log(`\n  [${label}] Cleaning up ${RUN_CREATED_DSEQS.size} deployment(s) created in this run...`);
+  // Close in reverse-ish order (higher DSEQ first) just for readability.
+  const dseqs = Array.from(RUN_CREATED_DSEQS).sort((a, b) => b - a);
+  for (const d of dseqs) {
+    await closeDeploymentQuiet(RUN_CHAIN_SDK, RUN_OWNER, d, label);
   }
 }
 
@@ -124,6 +169,36 @@ function toPipedPem(pem: string): string {
     .replace(/\n/g, '|')
     .replace(/\|+$/g, '')
     .replace(/^\|+/g, '');
+}
+
+function redactDatabaseUrl(databaseUrl: string): string {
+  // postgresql://user:password@host:port/db  ->  postgresql://user:<redacted>@host:port/db
+  return databaseUrl.replace(/\/\/([^:]+):([^@]+)@/g, '//$1:<redacted>@');
+}
+
+function loadProxyTlsMaterial(): { certPiped: string; keyPiped: string; source: 'env' | 'files' } {
+  const envCert = process.env.PINGAP_TLS_CERT;
+  const envKey = process.env.PINGAP_TLS_KEY;
+  if (envCert && envKey) {
+    return { certPiped: toPipedPem(envCert), keyPiped: toPipedPem(envKey), source: 'env' };
+  }
+
+  const certFile = path.join(ROOT, 'infrastructure-proxy/certs/origin.crt');
+  const keyFile = path.join(ROOT, 'infrastructure-proxy/certs/origin.key');
+  if (fs.existsSync(certFile) && fs.existsSync(keyFile)) {
+    const originCert = fs.readFileSync(certFile, 'utf8');
+    const originKey = fs.readFileSync(keyFile, 'utf8');
+    return { certPiped: toPipedPem(originCert), keyPiped: toPipedPem(originKey), source: 'files' };
+  }
+
+  throw new Error(
+    [
+      'Missing SSL proxy TLS material.',
+      'Provide either:',
+      '- env: PINGAP_TLS_CERT + PINGAP_TLS_KEY (pipe-separated PEM recommended), or',
+      '- local files: infrastructure-proxy/certs/origin.crt and infrastructure-proxy/certs/origin.key',
+    ].join('\n')
+  );
 }
 
 function hr(title: string) {
@@ -185,6 +260,8 @@ interface DeployResult {
   gseq: number;
   oseq: number;
   providerHostUri: string;
+  bidAmount?: string;
+  bidDenom?: string;
 }
 
 interface DatabaseResult extends DeployResult {
@@ -225,89 +302,152 @@ async function deploySDL(
   label: string,
   sdlFilePath?: string,
 ): Promise<DeployResult> {
-  console.log(`\n  [${label}] Parsing SDL...`);
-  const sdl = SDL.fromString(sdlContent, 'beta3');
-  const groups = sdl.groups();
-  const hash = await sdl.manifestVersion();
+  let dseq = 0;
+  let provider = '';
+  let gseq = 1;
+  let oseq = 1;
+  let providerHostUri = '';
+  let bidAmount: string | undefined;
+  let bidDenom: string | undefined;
 
-  // Get current block height for DSEQ
-  const statusResponse = await chainSDK.cosmos.base.tendermint.v1beta1.getLatestBlock({});
-  const dseq = Number(statusResponse.block?.header?.height || 0);
-  if (!dseq) throw new Error('Could not determine block height for DSEQ');
+  try {
+    console.log(`\n  [${label}] Parsing SDL...`);
+    const sdl = SDL.fromString(sdlContent, 'beta3');
+    const groups = sdl.groups();
+    const hash = await sdl.manifestVersion();
 
-  console.log(`  [${label}] Creating deployment (DSEQ: ${dseq})...`);
-  await chainSDK.akash.deployment.v1beta4.createDeployment({
-    id: { owner, dseq: BigInt(dseq) },
-    groups,
-    hash,
-    deposit: {
-      amount: { denom: 'uakt', amount: String(depositUakt) },
-      sources: [1],
-    },
-  });
-  console.log(`  [${label}] Deployment created. DSEQ: ${dseq}`);
+    // Get current block height for DSEQ
+    const statusResponse = await chainSDK.cosmos.base.tendermint.v1beta1.getLatestBlock({});
+    dseq = Number(statusResponse.block?.header?.height || 0);
+    if (!dseq) throw new Error('Could not determine block height for DSEQ');
 
-  // Wait for bids
-  console.log(`  [${label}] Waiting 30s for bids...`);
-  await sleep(30_000);
+    console.log(`  [${label}] Creating deployment (DSEQ: ${dseq})...`);
+    await chainSDK.akash.deployment.v1beta4.createDeployment({
+      id: { owner, dseq: BigInt(dseq) },
+      groups,
+      hash,
+      deposit: {
+        amount: { denom: 'uakt', amount: String(depositUakt) },
+        sources: [1],
+      },
+    });
+    RUN_CREATED_DSEQS.add(dseq);
+    console.log(`  [${label}] Deployment created. DSEQ: ${dseq}`);
 
-  const bidsResponse = await chainSDK.akash.market.v1beta5.getBids({
-    filters: { owner, dseq: BigInt(dseq) },
-  });
+    // Wait for bids
+    console.log(`  [${label}] Waiting 30s for bids...`);
+    await sleep(30_000);
 
-  const bids = bidsResponse.bids || [];
-  if (bids.length === 0) throw new Error(`[${label}] No bids received.`);
+    const bidsResponse = await chainSDK.akash.market.v1beta5.getBids({
+      filters: { owner, dseq: BigInt(dseq) },
+    });
 
-  console.log(`  [${label}] Received ${bids.length} bid(s).`);
+    const bids = bidsResponse.bids || [];
+    if (bids.length === 0) throw new Error(`[${label}] No bids received.`);
 
-  // Merge always-exclude with deployment-specific excludes
-  const allExclude = new Set([...excludeProviders, ...ALWAYS_EXCLUDE]);
+    console.log(`  [${label}] Received ${bids.length} bid(s).`);
 
-  // Filter to non-excluded bids
-  const usableBids = bids.filter((b: any) => {
-    const p = b.bid?.id?.provider;
-    return p && !allExclude.has(p);
-  });
+    const getBidPrice = (b: any): { amount?: string; denom?: string; num?: number } => {
+      const price = b?.bid?.price;
+      const amount = price?.amount != null ? String(price.amount) : undefined;
+      const denom = price?.denom != null ? String(price.denom) : undefined;
+      const num = amount != null ? Number(amount) : Number.NaN;
+      return { amount, denom, num: Number.isFinite(num) ? num : undefined };
+    };
 
-  if (usableBids.length === 0) {
-    const providers = bids.map((b: any) => b.bid?.id?.provider).filter(Boolean);
-    throw new Error(
-      `[${label}] No usable bids after exclusions. Providers: ${providers.join(', ')}. Excluded: ${Array.from(allExclude).join(', ')}`
-    );
-  }
+    // Merge always-exclude with deployment-specific excludes + per-service failing providers registry
+    const registryExclude = getFailingProvidersForService({ service: label, minFails: 2 });
+    const allExclude = new Set([...excludeProviders, ...ALWAYS_EXCLUDE, ...registryExclude]);
 
-  // Log all usable providers
-  console.log(`  [${label}] Usable providers: ${usableBids.map((b: any) => b.bid?.id?.provider).join(', ')}`);
+    // Filter to non-excluded bids
+    const usableBids = bids.filter((b: any) => {
+      const p = b.bid?.id?.provider;
+      return p && !allExclude.has(p);
+    });
 
-  // Prefer known-good providers first, then fall back to any usable bid
-  const preferred = usableBids.find((b: any) =>
-    PREFERRED_PROVIDERS.includes(b.bid?.id?.provider)
-  );
-  const selected = preferred || usableBids[0];
+    if (usableBids.length === 0) {
+      const providers = bids.map((b: any) => b.bid?.id?.provider).filter(Boolean);
+      throw new Error(
+        `[${label}] No usable bids after exclusions. Providers: ${providers.join(', ')}. Excluded: ${Array.from(allExclude).join(', ')}`
+      );
+    }
 
-  if (!selected?.bid?.id) {
-    throw new Error(`[${label}] No usable bids after exclusions.`);
-  }
-  if (preferred) {
-    console.log(`  [${label}] ✓ Using PREFERRED provider.`);
-  } else {
-    console.log(`  [${label}] ⚠ No preferred provider available, using first usable bid.`);
-  }
+    // Log all usable providers
+    console.log(`  [${label}] Usable providers: ${usableBids.map((b: any) => b.bid?.id?.provider).join(', ')}`);
 
-  const bidId = selected.bid.id;
-  const provider = bidId.provider;
-  const gseq = Number(bidId.gseq || 1);
-  const oseq = Number(bidId.oseq || 1);
-  const bseq = Number(bidId.bseq || 0);
+    // Prefer explicitly configured providers first.
+    const preferred = PREFERRED_PROVIDERS.length
+      ? usableBids.find((b: any) => PREFERRED_PROVIDERS.includes(b.bid?.id?.provider))
+      : undefined;
 
-  console.log(`  [${label}] Selected provider: ${provider}`);
+    // Otherwise, choose the cheapest bid, preferring providers that have
+    // previously *successfully* installed this service at least once.
+    const knownWorking = getKnownWorkingProvidersForService({ service: label });
+    const sortByPrice = (arr: any[]) =>
+      arr
+        .slice()
+        .sort((a, b) => {
+          const pa = getBidPrice(a).num ?? Number.POSITIVE_INFINITY;
+          const pb = getBidPrice(b).num ?? Number.POSITIVE_INFINITY;
+          return pa - pb;
+        });
 
-  // Create lease
-  console.log(`  [${label}] Creating lease...`);
-  await chainSDK.akash.market.v1beta5.createLease({
-    bidId: { owner, dseq: BigInt(dseq), gseq, oseq, provider, bseq },
-  });
-  console.log(`  [${label}] Lease created.`);
+    const usableWorking = usableBids.filter((b: any) => knownWorking.has(b.bid?.id?.provider));
+    const cheapestWorking = sortByPrice(usableWorking)[0];
+    const cheapestAny = sortByPrice(usableBids)[0];
+
+    const selected = preferred || cheapestWorking || cheapestAny;
+    if (!selected?.bid?.id) throw new Error(`[${label}] No usable bids after exclusions.`);
+
+    if (preferred) {
+      console.log(`  [${label}] ✓ Using PREFERRED provider (explicit list).`);
+    } else if (cheapestWorking) {
+      const p = getBidPrice(cheapestWorking);
+      console.log(
+        `  [${label}] ✓ Using cheapest KNOWN-WORKING provider (price=${p.amount || '?'} ${p.denom || ''})`
+      );
+    } else {
+      const p = getBidPrice(cheapestAny);
+      console.log(`  [${label}] ✓ Using cheapest provider (price=${p.amount || '?'} ${p.denom || ''})`);
+    }
+
+    const bidId = selected.bid.id;
+    provider = bidId.provider;
+    gseq = Number(bidId.gseq || 1);
+    oseq = Number(bidId.oseq || 1);
+    const bseq = Number(bidId.bseq || 0);
+    {
+      const p = getBidPrice(selected);
+      bidAmount = p.amount;
+      bidDenom = p.denom;
+    }
+
+    console.log(`  [${label}] Selected provider: ${provider}`);
+
+    // Log bid landscape (best-effort). This is safe to persist (no secrets).
+    appendBidsLog({
+      at: new Date().toISOString(),
+      service: label,
+      dseq,
+      excluded: Array.from(allExclude),
+      usableBids: usableBids.map((b: any) => {
+        const p = getBidPrice(b);
+        return {
+          provider: b?.bid?.id?.provider,
+          amount: p.amount,
+          denom: p.denom,
+        };
+      }),
+      selected: { provider, amount: bidAmount, denom: bidDenom },
+      selectionMode: preferred ? 'preferred' : cheapestWorking ? 'cheapest_known_working' : 'cheapest',
+    });
+
+    // Create lease
+    console.log(`  [${label}] Creating lease...`);
+    await chainSDK.akash.market.v1beta5.createLease({
+      bidId: { owner, dseq: BigInt(dseq), gseq, oseq, provider, bseq },
+    });
+    console.log(`  [${label}] Lease created.`);
 
   // Wait until the lease is visible on-chain (and not immediately closed).
   // provider-services filters for ACTIVE leases before sending manifests.
@@ -353,9 +493,9 @@ async function deploySDL(
   await sleep(10_000);
 
   // Send manifest (with retries - large deployments can cause socket hangups)
-  // CRITICAL: When USE_CLI_MANIFEST is true, we use the Go CLI binary to avoid
-  // the JS SDK ↔ Go provider canonical-JSON hash mismatch that causes providers
-  // to silently reject manifests (resulting in persistent "kube: lease not found").
+  // CRITICAL: When USE_CLI_MANIFEST is true, we use the same `provider-services`
+  // manifest-sending path as CI/CD. In practice this can be more operationally
+  // reliable on some providers.
   console.log(`  [${label}] Sending manifest${USE_CLI_MANIFEST ? ' (via CLI)' : ' (via JS SDK)'}...`);
 
   // Log manifest hash for diagnostics
@@ -403,10 +543,10 @@ async function deploySDL(
     }
   }
 
-  // Get provider host URI
-  const providerRes = await chainSDK.akash.provider.v1beta4.getProvider({ owner: provider });
-  const providerHostUri = providerRes.provider?.hostUri;
-  if (!providerHostUri) throw new Error(`[${label}] Could not resolve provider hostUri`);
+    // Get provider host URI
+    const providerRes = await chainSDK.akash.provider.v1beta4.getProvider({ owner: provider });
+    providerHostUri = providerRes.provider?.hostUri || '';
+    if (!providerHostUri) throw new Error(`[${label}] Could not resolve provider hostUri`);
 
   // Provider-ACK loop:
   // If the provider returns "lease not found" immediately after manifest submit,
@@ -466,7 +606,25 @@ async function deploySDL(
     }
   }
 
-  return { dseq, provider, gseq, oseq, providerHostUri };
+    // NOTE: we intentionally do NOT mark a provider as "working" here.
+    // "Working" means the service actually becomes ready (handled by the
+    // per-service wrapper after `waitForServices` / IP lease assignment).
+    return { dseq, provider, gseq, oseq, providerHostUri, bidAmount, bidDenom };
+  } catch (e: any) {
+    const msg = e?.message || String(e);
+    if (provider) {
+      recordProviderResult({
+        service: label,
+        provider,
+        outcome: 'failing',
+        reason: msg,
+        dseq: dseq || undefined,
+        bidAmount,
+        bidDenom,
+      });
+    }
+    throw e;
+  }
 }
 
 async function waitForServices(
@@ -590,7 +748,7 @@ async function deployDatabase(
 ): Promise<DatabaseResult> {
   hr('STEP 2: Deploy PostgreSQL (standalone)');
 
-  const dbPassword = mustEnv('YSQL_PASSWORD');
+  const dbPassword = mustDbPassword();
   let sdlContent = mustReadFile(path.join(ROOT, 'service-cloud-api/infra/postgres-standalone.yaml'));
   sdlContent = sdlContent.replace(/\$\{POSTGRES_PASSWORD\}/g, dbPassword);
 
@@ -636,12 +794,29 @@ async function deployDatabase(
         throw new Error('[postgres] Could not extract forwarded port for 5432.');
       }
 
+      recordProviderResult({
+        service: 'postgres',
+        provider: result.provider,
+        outcome: 'working',
+        dseq: result.dseq,
+        bidAmount: result.bidAmount,
+        bidDenom: result.bidDenom,
+      });
       return { ...result, dbHost, dbPort };
     } catch (e: any) {
       lastError = e;
       console.log(
         `  [postgres] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`
       );
+      recordProviderResult({
+        service: 'postgres',
+        provider: result.provider,
+        outcome: 'failing',
+        reason: e?.message || String(e),
+        dseq: result.dseq,
+        bidAmount: result.bidAmount,
+        bidDenom: result.bidDenom,
+      });
       triedProviders.add(result.provider);
       await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'postgres');
       console.log(`  [postgres] Retrying with a different provider in 10s...`);
@@ -660,7 +835,7 @@ async function deployData(
   certificate: any,
   excludeProviders: Set<string>
 ): Promise<DataResult> {
-  hr('STEP 3: Deploy data services (IPFS + Jaeger + OTel)');
+  hr('STEP 3: Deploy data services (IPFS + Jaeger)');
 
   let sdlContent = mustReadFile(path.join(ROOT, 'service-cloud-api/deploy-data.yaml'));
   sdlContent = injectGhcrCredentials(sdlContent);
@@ -709,8 +884,9 @@ async function deployData(
             break;
           }
         }
-        const otelPorts = status.forwarded_ports['otel-collector'] || [];
-        for (const fp of otelPorts) {
+        // OTel collector is currently disabled; export directly to Jaeger OTLP/HTTP (4318).
+        const jaegerPorts = status.forwarded_ports['jaeger'] || [];
+        for (const fp of jaegerPorts) {
           if (fp.port === 4318) {
             otelHost = fp.host;
             otelPort = fp.externalPort;
@@ -731,10 +907,27 @@ async function deployData(
         throw new Error('[data] Could not extract IPFS API forwarded port (5001).');
       }
 
+      recordProviderResult({
+        service: 'data',
+        provider: result.provider,
+        outcome: 'working',
+        dseq: result.dseq,
+        bidAmount: result.bidAmount,
+        bidDenom: result.bidDenom,
+      });
       return { ...result, ipfsIngressUrl, ipfsApiHost, ipfsApiPort, otelHost, otelPort, jaegerIngressUrl };
     } catch (e: any) {
       lastError = e;
       console.log(`  [data] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`);
+      recordProviderResult({
+        service: 'data',
+        provider: result.provider,
+        outcome: 'failing',
+        reason: e?.message || String(e),
+        dseq: result.dseq,
+        bidAmount: result.bidAmount,
+        bidDenom: result.bidDenom,
+      });
       triedProviders.add(result.provider);
       await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'data');
       console.log(`  [data] Retrying with a different provider in 10s...`);
@@ -778,7 +971,7 @@ async function deployAuth(
   sdlContent = sdlContent.replace(
     '      # DATABASE_URL is now fetched from Infisical at runtime (PostgreSQL connection string)\n' +
       '      # Format: postgresql://user:password@host:5432/database',
-    `      # Database - YugabyteDB deployment (direct env var, no Infisical)\n` +
+    `      # Database - PostgreSQL (direct env var, no Infisical)\n` +
       `      - DATABASE_URL=${databaseUrl}\n` +
       `      # Secrets injected directly (Infisical skipped)\n` +
       `      - JWT_SECRET=${jwtSecret}\n` +
@@ -822,10 +1015,27 @@ async function deployAuth(
         throw new Error('[auth] Could not detect ingress URL from lease status.');
       }
 
+      recordProviderResult({
+        service: 'auth',
+        provider: result.provider,
+        outcome: 'working',
+        dseq: result.dseq,
+        bidAmount: result.bidAmount,
+        bidDenom: result.bidDenom,
+      });
       return { ...result, ingressUrl };
     } catch (e: any) {
       lastError = e;
       console.log(`  [auth] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`);
+      recordProviderResult({
+        service: 'auth',
+        provider: result.provider,
+        outcome: 'failing',
+        reason: e?.message || String(e),
+        dseq: result.dseq,
+        bidAmount: result.bidAmount,
+        bidDenom: result.bidDenom,
+      });
       triedProviders.add(result.provider);
       await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'auth');
       console.log(`  [auth] Retrying with a different provider in 10s...`);
@@ -913,10 +1123,27 @@ async function deployApi(
         throw new Error('[api] Could not detect ingress URL from lease status.');
       }
 
+      recordProviderResult({
+        service: 'api',
+        provider: result.provider,
+        outcome: 'working',
+        dseq: result.dseq,
+        bidAmount: result.bidAmount,
+        bidDenom: result.bidDenom,
+      });
       return { ...result, apiIngressUrl };
     } catch (e: any) {
       lastError = e;
       console.log(`  [api] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`);
+      recordProviderResult({
+        service: 'api',
+        provider: result.provider,
+        outcome: 'failing',
+        reason: e?.message || String(e),
+        dseq: result.dseq,
+        bidAmount: result.bidAmount,
+        bidDenom: result.bidDenom,
+      });
       triedProviders.add(result.provider);
       await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'api');
       console.log(`  [api] Retrying with a different provider in 10s...`);
@@ -937,16 +1164,12 @@ async function deployProxy(
 ): Promise<ProxyResult> {
   hr('STEP 6: Deploy SSL proxy (Pingap with IP lease)');
 
-  const certFile = path.join(ROOT, 'infrastructure-proxy/certs/origin.crt');
-  const keyFile = path.join(ROOT, 'infrastructure-proxy/certs/origin.key');
   const sdlTemplateFile = path.join(ROOT, 'infrastructure-proxy/deploy-akash-ip-lease.yaml');
-
-  const originCert = mustReadFile(certFile);
-  const originKey = mustReadFile(keyFile);
+  const tls = loadProxyTlsMaterial();
 
   let sdlContent = mustReadFile(sdlTemplateFile);
-  sdlContent = sdlContent.replace('<REPLACE_WITH_ORIGIN_CERT>', toPipedPem(originCert));
-  sdlContent = sdlContent.replace('<REPLACE_WITH_ORIGIN_KEY>', toPipedPem(originKey));
+  sdlContent = sdlContent.replace('<REPLACE_WITH_ORIGIN_CERT>', tls.certPiped);
+  sdlContent = sdlContent.replace('<REPLACE_WITH_ORIGIN_KEY>', tls.keyPiped);
 
   if (sdlContent.includes('<REPLACE_WITH_ORIGIN_CERT>') || sdlContent.includes('<REPLACE_WITH_ORIGIN_KEY>')) {
     throw new Error('SDL TLS placeholders were not replaced.');
@@ -954,6 +1177,8 @@ async function deployProxy(
 
   const triedProviders = new Set<string>();
   let lastError: any = null;
+
+  console.log(`  [SSL-proxy] TLS source: ${tls.source}`);
 
   for (let attempt = 1; attempt <= MAX_PROVIDER_FAILOVERS; attempt++) {
     const attemptExclude = new Set<string>([...excludeProviders, ...triedProviders]);
@@ -1001,6 +1226,14 @@ async function deployProxy(
 
           if (ip) {
             console.log(`  [SSL-proxy] Leased IP: ${ip}`);
+            recordProviderResult({
+              service: 'SSL-proxy',
+              provider: result.provider,
+              outcome: 'working',
+              dseq: result.dseq,
+              bidAmount: result.bidAmount,
+              bidDenom: result.bidDenom,
+            });
             return { ...result, ip };
           }
 
@@ -1016,6 +1249,15 @@ async function deployProxy(
       console.log(
         `  [SSL-proxy] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`
       );
+      recordProviderResult({
+        service: 'SSL-proxy',
+        provider: result.provider,
+        outcome: 'failing',
+        reason: e?.message || String(e),
+        dseq: result.dseq,
+        bidAmount: result.bidAmount,
+        bidDenom: result.bidDenom,
+      });
       triedProviders.add(result.provider);
       await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'SSL-proxy');
       console.log(`  [SSL-proxy] Retrying with a different provider in 10s...`);
@@ -1071,11 +1313,7 @@ function updateConfigFiles(
     // Update [upstreams.auth] addrs and sni
     const authAddrsIdx = findLineAfter(pingapLines, '[upstreams.auth]', 'addrs');
     if (authAddrsIdx !== -1) {
-      pingapLines[authAddrsIdx] = `addrs = ["${auth.ingressUrl}:443"]`;
-    }
-    const authSniIdx = findLineAfter(pingapLines, '[upstreams.auth]', 'sni');
-    if (authSniIdx !== -1) {
-      pingapLines[authSniIdx] = `sni = "${auth.ingressUrl}"`;
+      pingapLines[authAddrsIdx] = `addrs = ["${auth.ingressUrl}:80"]`;
     }
     updateHostHeader(pingapLines, '[locations.auth]', auth.ingressUrl);
   }
@@ -1084,28 +1322,9 @@ function updateConfigFiles(
     // Update [upstreams.api] addrs and sni
     const apiAddrsIdx = findLineAfter(pingapLines, '[upstreams.api]', 'addrs');
     if (apiAddrsIdx !== -1) {
-      pingapLines[apiAddrsIdx] = `addrs = ["${api.apiIngressUrl}:443"]`;
-    }
-    const apiSniIdx = findLineAfter(pingapLines, '[upstreams.api]', 'sni');
-    if (apiSniIdx !== -1) {
-      pingapLines[apiSniIdx] = `sni = "${api.apiIngressUrl}"`;
+      pingapLines[apiAddrsIdx] = `addrs = ["${api.apiIngressUrl}:80"]`;
     }
     updateHostHeader(pingapLines, '[locations.api]', api.apiIngressUrl);
-  }
-
-  if (data.ipfsIngressUrl) {
-    // Update [upstreams.ipfs] addrs and sni
-    const ipfsAddrsIdx = findLineAfter(pingapLines, '[upstreams.ipfs]', 'addrs');
-    if (ipfsAddrsIdx !== -1) {
-      pingapLines[ipfsAddrsIdx] = `addrs = ["${data.ipfsIngressUrl}:443"]`;
-    }
-    const ipfsSniIdx = findLineAfter(pingapLines, '[upstreams.ipfs]', 'sni');
-    if (ipfsSniIdx !== -1) {
-      pingapLines[ipfsSniIdx] = `sni = "${data.ipfsIngressUrl}"`;
-    }
-    updateHostHeader(pingapLines, '[locations.website]', data.ipfsIngressUrl);
-    updateHostHeader(pingapLines, '[locations.docs]', data.ipfsIngressUrl);
-    updateHostHeader(pingapLines, '[locations.app]', data.ipfsIngressUrl);
   }
 
   fs.writeFileSync(pingapPath, pingapLines.join('\n'));
@@ -1149,8 +1368,8 @@ function updateConfigFiles(
 
 | Service | DSEQ | Provider | Deployed | Notes |
 |---------|------|----------|----------|-------|
-| yugabyte (db) | ${database.dseq} | \`${database.provider}\` | ${now} | 3-node YugabyteDB cluster |
-| data services | ${data.dseq} | \`${data.provider}\` | ${now} | IPFS + Jaeger + OTel Collector |
+| postgres (db) | ${database.dseq} | \`${database.provider}\` | ${now} | PostgreSQL 16 Alpine, persistent storage |
+| data services | ${data.dseq} | \`${data.provider}\` | ${now} | IPFS + Jaeger (OTel collector disabled) |
 | api | ${api.dseq} | \`${api.provider}\` | ${now} | GraphQL API |
 | service-auth | ${auth.dseq} | \`${auth.provider}\` | ${now} | Standalone auth service |
 | infrastructure-proxy (SSL) | ${proxy.dseq} | \`${proxy.provider}\` | ${now} | Pingap SSL proxy, dedicated IP ${proxy.ip || 'TBD'} |
@@ -1160,16 +1379,16 @@ function updateConfigFiles(
 - **API**: https://api.alternatefutures.ai (via SSL proxy)
 - **Auth**: https://auth.alternatefutures.ai (via SSL proxy)
 - **Web App**: https://app.alternatefutures.ai (Vercel)
-- **YugabyteDB Admin**: https://yb.alternatefutures.ai
-- **IPFS Gateway**: https://ipfs.alternatefutures.ai
-- **OTel Metrics**: https://otel-metrics.alternatefutures.ai
+- **Data services (IPFS + Jaeger)**: deployed on Akash — see Cloudmos for provider ingress URLs (custom-domain routing depends on \`infrastructure-proxy/pingap.toml\`)
 
 ## Database Connection
 
-YugabyteDB is exposed globally via TCP from the yugabyte deployment:
+PostgreSQL is exposed globally via TCP:
 - **Host**: ${database.dbHost}
 - **Port**: ${database.dbPort}
-- **Connection string**: \`postgresql://yugabyte:<YSQL_PASSWORD>@${database.dbHost}:${database.dbPort}/alternatefutures\`
+- **User**: alternatefutures
+- **Database**: alternatefutures
+- **Connection string**: \`postgresql://alternatefutures:<password>@${database.dbHost}:${database.dbPort}/alternatefutures\`
 
 ## Secrets Management
 
@@ -1200,17 +1419,8 @@ The auth service reads JWT_SECRET, RESEND_API_KEY, etc. from env vars.
 
 | Provider | Reason |
 |----------|--------|
-| \`akash1smapjx8m8363nmdvc2yr9atlqy8vcql73m9l0v\` | Broken hostname (\`provider.provider.akash-provider.xyz\`) |
-
-## Provider Reference
-
-| Provider | DSEQ | Service |
-|----------|------|---------|
-| \`${database.provider}\` | ${database.dseq} | yugabyte (db) |
-| \`${data.provider}\` | ${data.dseq} | data services (ipfs/jaeger/otel) |
-| \`${api.provider}\` | ${api.dseq} | api |
-| \`${auth.provider}\` | ${auth.dseq} | service-auth |
-| \`${proxy.provider}\` | ${proxy.dseq} | infrastructure-proxy (SSL) |
+| \`akash1smapjx8m8363nmdvc2yr9atlqy8vcql73m9l0v\` | Broken hostname |
+| \`akash1qmumr9mdnu9e8ymyr3nnf3qyjfkugj79eh6jzq\` | yggdrasil-compute.com - broken DNS (doubled provider prefix) |
 
 ---
 
@@ -1229,22 +1439,21 @@ This file tracks active deployments on Akash Network. All information here is pu
 
 ## Active Deployments
 
-### yugabyte (database)
+### postgres (database)
 | Field | Value |
 |-------|-------|
 | **DSEQ** | ${database.dseq} |
 | **Provider** | \`${database.provider}\` |
-| **Services** | 3-node YugabyteDB cluster |
-| **Custom Domains** | yb.alternatefutures.ai |
+| **Services** | PostgreSQL 16 Alpine |
 | **Status** | Running |
 
-### data services (IPFS + Jaeger + OTel)
+### data services (IPFS + Jaeger)
 | Field | Value |
 |-------|-------|
 | **DSEQ** | ${data.dseq} |
 | **Provider** | \`${data.provider}\` |
-| **Services** | IPFS + Jaeger + OTel Collector |
-| **Custom Domains** | ipfs.alternatefutures.ai, jaeger.alternatefutures.ai, otel-metrics.alternatefutures.ai |
+| **Services** | IPFS + Jaeger (OTel collector disabled) |
+| **Ingress** | See Cloudmos for provider ingress URIs (custom-domain routing depends on \`infrastructure-proxy/pingap.toml\`) |
 | **Status** | Running |
 
 ### api
@@ -1254,6 +1463,7 @@ This file tracks active deployments on Akash Network. All information here is pu
 | **Provider** | \`${api.provider}\` |
 | **Image** | \`ghcr.io/alternatefutures/service-cloud-api:latest\` |
 | **Custom Domain** | api.alternatefutures.ai (via SSL proxy) |
+| **Ingress** | \`${api.apiIngressUrl}\` |
 | **Status** | Running |
 | **CI/CD** | \`deploy-akash.yml\` (full) / \`update-manifest.yml\` (in-place) |
 
@@ -1277,16 +1487,16 @@ This file tracks active deployments on Akash Network. All information here is pu
 | **Domains Routed** | auth, api, app, docs.alternatefutures.ai |
 | **Status** | Running |
 
-## Database (YugabyteDB)
+## Database (PostgreSQL)
 
-YugabyteDB is deployed separately and exposed globally via TCP:
+PostgreSQL is deployed separately and exposed globally via TCP:
 | Field | Value |
 |-------|-------|
 | **Host** | ${database.dbHost} |
 | **Port** | ${database.dbPort} |
 | **Database** | alternatefutures |
-| **User** | yugabyte |
-| **Connection** | \`postgresql://yugabyte:<password>@${database.dbHost}:${database.dbPort}/alternatefutures\` |
+| **User** | alternatefutures |
+| **Connection** | \`postgresql://alternatefutures:<password>@${database.dbHost}:${database.dbPort}/alternatefutures\` |
 
 ## Secrets Management
 
@@ -1308,26 +1518,15 @@ All custom domains route through the SSL proxy (Pingap on Cloudflare's Pingora f
 | auth.alternatefutures.ai | SSL proxy (${proxy.ip || 'TBD'}) | Cloudflare Origin Cert |
 | api.alternatefutures.ai | SSL proxy (${proxy.ip || 'TBD'}) | Cloudflare Origin Cert |
 | app.alternatefutures.ai | Vercel | Vercel managed |
-| yb.alternatefutures.ai | SSL proxy (${proxy.ip || 'TBD'}) | Cloudflare Origin Cert |
-| ipfs.alternatefutures.ai | SSL proxy (${proxy.ip || 'TBD'}) | Cloudflare Origin Cert |
-| jaeger.alternatefutures.ai | SSL proxy (${proxy.ip || 'TBD'}) | Cloudflare Origin Cert |
-| otel-metrics.alternatefutures.ai | SSL proxy (${proxy.ip || 'TBD'}) | Cloudflare Origin Cert |
-
-## Quick Reference: DSEQ to Service
-
-| DSEQ | Service | Primary URL |
-|------|---------|-------------|
-| ${database.dseq} | yugabyte (db) | yb.alternatefutures.ai |
-| ${data.dseq} | data services | ipfs.alternatefutures.ai |
-| ${api.dseq} | api | api.alternatefutures.ai |
-| ${auth.dseq} | service-auth | auth.alternatefutures.ai |
-| ${proxy.dseq} | infrastructure-proxy (SSL) | ${proxy.ip || 'TBD'} |
+| ipfs.alternatefutures.ai | TBD (data services deployment) | TBD |
+| jaeger.alternatefutures.ai | TBD (data services deployment) | TBD |
 
 ## Blocked Providers
 
 | Provider | Reason |
 |----------|--------|
 | \`akash1smapjx8m8363nmdvc2yr9atlqy8vcql73m9l0v\` | Broken hostname |
+| \`akash1qmumr9mdnu9e8ymyr3nnf3qyjfkugj79eh6jzq\` | yggdrasil-compute.com - broken DNS (doubled provider prefix) |
 
 ## View Deployments
 
@@ -1352,8 +1551,9 @@ function printSummary(
   data: DataResult,
   api: ApiResult,
   auth: AuthResult,
-  proxy: ProxyResult,
-  databaseUrl: string
+  proxy: ProxyResult | null,
+  databaseUrl: string,
+  opts?: { skipManualSteps?: boolean }
 ) {
   hr('DEPLOYMENT COMPLETE - SUMMARY');
 
@@ -1380,21 +1580,24 @@ function printSummary(
     Ingress:  ${auth.ingressUrl || '(check Akash Console)'}
 
   SSL Proxy
-    DSEQ:     ${proxy.dseq}
-    Provider: ${proxy.provider}
-    IP:       ${proxy.ip || '(check Akash Console)'}
+    ${proxy ? `DSEQ:     ${proxy.dseq}\n    Provider: ${proxy.provider}\n    IP:       ${proxy.ip || '(check Akash Console)'}` : '(skipped)'}
 `);
 
+  if (opts?.skipManualSteps) return;
+
   hr('MANUAL STEPS REQUIRED');
+
+  const databaseUrlRedacted = redactDatabaseUrl(databaseUrl);
 
   console.log(`
   1. UPDATE GITHUB SECRETS:
      Set AUTH_DATABASE_URL to:
-     ${databaseUrl}
+     ${databaseUrlRedacted}
      If you use API workflows, also set DATABASE_URL to the same value.
+     (Replace <redacted> with your real DB password in your secret store.)
 
   2. UPDATE CLOUDFLARE DNS (if proxy IP changed):
-     A records for *.alternatefutures.ai -> ${proxy.ip || 'TBD'}
+     A records for *.alternatefutures.ai -> ${proxy?.ip || 'TBD'}
 
   3. REBUILD & PUSH PROXY IMAGE (to apply updated pingap.toml):
      cd infrastructure-proxy
@@ -1408,6 +1611,73 @@ function printSummary(
 `);
 }
 
+// ─── Stale-process guard (lockfile-based) ────────────────────────────────────
+// Only one redeploy-all should run at a time — concurrent instances deadlock on
+// the wallet & Akash RPC. We use a lockfile containing the PID + process-group
+// so we can reliably kill a previous run without accidentally matching our own
+// ancestor shell (which also contains "redeploy-all.ts" in its command string).
+
+const LOCKFILE_PATH = path.resolve(__dirname, '../.local/redeploy.lock');
+
+function killStaleInstances(): void {
+  try {
+    if (!fs.existsSync(LOCKFILE_PATH)) return;
+
+    const raw = fs.readFileSync(LOCKFILE_PATH, 'utf-8').trim();
+    const stalePid = parseInt(raw, 10);
+    if (!stalePid || stalePid === process.pid) return;
+
+    // Check if that process is still alive
+    try {
+      process.kill(stalePid, 0); // signal 0 = existence check
+    } catch {
+      // Not running — stale lockfile, just clean it up
+      console.log(`  Stale lockfile (PID ${stalePid} already exited) — removing.`);
+      try { fs.unlinkSync(LOCKFILE_PATH); } catch { /* ignore */ }
+      return;
+    }
+
+    // It's still alive — kill the process group to get npm + tsx + children
+    console.log(`  ✖ Killing previous redeploy instance (PID ${stalePid})...`);
+    try {
+      // Try process group kill first (negative PID = process group)
+      process.kill(-stalePid, 'SIGKILL');
+    } catch {
+      // Fallback: kill just the PID (may not be a group leader)
+      try { process.kill(stalePid, 'SIGKILL'); } catch { /* gone */ }
+    }
+
+    // Also kill any orphaned child processes (npm exec tsx ...) via pkill
+    try {
+      execSync(
+        `pkill -9 -f "tsx scripts/(redeploy-all|close-all-deployments|summarize-provider-registry)\\.ts" 2>/dev/null || true`,
+        { stdio: 'pipe' },
+      );
+    } catch { /* best effort */ }
+
+    // Give processes a moment to die
+    try { execSync('sleep 1', { stdio: 'pipe' }); } catch { /* ignore */ }
+    console.log('  Previous instance terminated.');
+  } catch {
+    // Can't read lockfile or something else went wrong — continue anyway
+  }
+}
+
+function acquireLockfile(): void {
+  fs.mkdirSync(path.dirname(LOCKFILE_PATH), { recursive: true });
+  fs.writeFileSync(LOCKFILE_PATH, String(process.pid));
+}
+
+function releaseLockfile(): void {
+  try {
+    // Only remove if we still own it
+    const content = fs.readFileSync(LOCKFILE_PATH, 'utf-8').trim();
+    if (parseInt(content, 10) === process.pid) {
+      fs.unlinkSync(LOCKFILE_PATH);
+    }
+  } catch { /* ignore */ }
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -1415,16 +1685,29 @@ async function main() {
   console.log('  FULL CLEAN REDEPLOY - AlternateFutures');
   console.log('========================================\n');
 
+  // Kill any competing instances from previous runs to avoid wallet/RPC deadlocks
+  console.log('Checking for stale redeploy processes...');
+  killStaleInstances();
+  acquireLockfile();
+  // Release lockfile on any exit (normal, error, or signal)
+  const onExit = () => releaseLockfile();
+  process.on('exit', onExit);
+  process.on('SIGINT', () => { onExit(); process.exit(130); });
+  process.on('SIGTERM', () => { onExit(); process.exit(143); });
+  console.log('');
+
+  // Burn-in / telemetry modes (safe defaults: off)
+  const skipProxy = process.env.AKASH_REDEPLOY_SKIP_PROXY === '1';
+  const closeOnSuccess = process.env.AKASH_REDEPLOY_CLOSE_ON_SUCCESS === '1';
+
   // Validate required environment variables upfront
   console.log('Validating environment variables...');
-  const requiredVars = [
-    'YSQL_PASSWORD',
-    'JWT_SECRET',
-    'GHCR_PAT',
-    'AKASH_MNEMONIC',
-  ];
+  const requiredVars = ['JWT_SECRET', 'GHCR_PAT', 'AKASH_MNEMONIC'];
 
   const missing = requiredVars.filter((v) => !process.env[v]);
+  if (!process.env.POSTGRES_PASSWORD && !process.env.YSQL_PASSWORD) {
+    missing.push('POSTGRES_PASSWORD');
+  }
   if (missing.length > 0) {
     console.error(`\nMissing required environment variables:\n  ${missing.join('\n  ')}`);
     console.error('\nCopy .env.deploy.example to .env.deploy and fill in your values.');
@@ -1440,8 +1723,6 @@ async function main() {
     'service-cloud-api/deploy-api.yaml',
     'service-auth/deploy-akash.yaml',
     'infrastructure-proxy/deploy-akash-ip-lease.yaml',
-    'infrastructure-proxy/certs/origin.crt',
-    'infrastructure-proxy/certs/origin.key',
     'infrastructure-proxy/pingap.toml',
   ];
 
@@ -1454,6 +1735,19 @@ async function main() {
   }
   console.log('All required files present.\n');
 
+  // Validate proxy TLS material without printing it (open source-safe)
+  if (!skipProxy) {
+    try {
+      const tls = loadProxyTlsMaterial();
+      console.log(`SSL proxy TLS material present. Source: ${tls.source}\n`);
+    } catch (e: any) {
+      console.error(String(e?.message || e));
+      process.exit(1);
+    }
+  } else {
+    console.log('SSL proxy TLS check skipped (AKASH_REDEPLOY_SKIP_PROXY=1)\n');
+  }
+
   // Load wallet + certificate
   console.log('Loading wallet and certificate...');
   const { wallet, client, chainSDK } = await loadWalletAndClient();
@@ -1461,17 +1755,18 @@ async function main() {
   const owner = accounts[0]?.address;
   if (!owner) throw new Error('Could not determine wallet address');
   console.log(`Owner: ${owner}`);
+  RUN_OWNER = owner;
+  RUN_CHAIN_SDK = chainSDK;
 
   const certificate = await loadCertificate(wallet, client, chainSDK);
   console.log('Certificate loaded.\n');
 
   // Check if provider-services CLI is available for manifest sending.
-  // The Go CLI avoids the JS/Go canonical-JSON hash mismatch that causes
-  // persistent "kube: lease not found" errors across all providers.
+  // This mirrors the CI/CD path and can be more reliable on some providers.
   USE_CLI_MANIFEST = await hasProviderServicesCli();
   if (USE_CLI_MANIFEST) {
     console.log('✓ provider-services CLI detected — will use CLI for manifest sending (recommended).');
-    console.log('  This avoids the JS SDK ↔ Go provider manifest hash mismatch.\n');
+    console.log('  This mirrors the CI/CD manifest sending path.\n');
   } else {
     console.log('⚠ provider-services CLI not found — using JS SDK for manifest sending.');
     console.log('  If deployments fail with "kube: lease not found", install provider-services:');
@@ -1480,6 +1775,9 @@ async function main() {
 
   // Track providers to build exclusion lists
   const usedProviders = new Set<string>();
+
+  // In burn-in mode, we should not rewrite repo files (pingap.toml, workflows, DEPLOYMENTS.md)
+  const writeFiles = !closeOnSuccess && !skipProxy;
 
   // ── STEP 1: Close all ──
   await closeAllDeployments(chainSDK, owner);
@@ -1493,9 +1791,9 @@ async function main() {
   usedProviders.add(data.provider);
 
   // Construct DATABASE_URL
-  const dbPassword = mustEnv('YSQL_PASSWORD');
+  const dbPassword = mustDbPassword();
   const databaseUrl = `postgresql://alternatefutures:${dbPassword}@${database.dbHost}:${database.dbPort}/alternatefutures`;
-  console.log(`\n  DATABASE_URL: ${databaseUrl}`);
+  console.log(`\n  DATABASE_URL: ${redactDatabaseUrl(databaseUrl)}`);
 
   // Construct IPFS API URL + OTel endpoint
   const ipfsApiUrl = `http://${data.ipfsApiHost}:${data.ipfsApiPort}`;
@@ -1526,20 +1824,44 @@ async function main() {
   usedProviders.add(api.provider);
 
   // ── STEP 6: Deploy SSL proxy ──
-  // Exclude all other providers (proxy must be separate to avoid NAT hairpin)
-  const proxy = await deployProxy(chainSDK, owner, certificate, usedProviders);
+  let proxy: ProxyResult | null = null;
+  if (!skipProxy) {
+    // Exclude all other providers (proxy must be separate to avoid NAT hairpin)
+    proxy = await deployProxy(chainSDK, owner, certificate, usedProviders);
+  } else {
+    hr('STEP 6: Deploy SSL proxy (skipped)');
+    console.log('  AKASH_REDEPLOY_SKIP_PROXY=1 so the SSL proxy step is skipped.');
+  }
 
   // ── STEP 7: Update config files ──
-  updateConfigFiles(database, data, api, auth, proxy);
+  if (writeFiles && proxy) {
+    updateConfigFiles(database, data, api, auth, proxy);
+  } else if (!writeFiles) {
+    hr('STEP 7: Update config files (skipped)');
+    console.log('  Burn-in mode: file updates are disabled (no repo writes).');
+  } else if (!proxy) {
+    hr('STEP 7: Update config files (skipped)');
+    console.log('  Proxy was skipped, so config updates are not applied.');
+  }
 
   // ── STEP 8: Print summary ──
-  printSummary(database, data, api, auth, proxy, databaseUrl);
+  printSummary(database, data, api, auth, proxy, databaseUrl, { skipManualSteps: closeOnSuccess || skipProxy });
+
+  if (closeOnSuccess) {
+    hr('BURN-IN MODE: Closing deployments');
+    console.log('  AKASH_REDEPLOY_CLOSE_ON_SUCCESS=1 so deployments from this run will be closed.');
+    await cleanupRunDeployments('cleanup-success');
+  }
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
   console.error('\nFATAL ERROR:', e?.message || e);
-  console.error('\nIf a deployment was partially created, you may need to close it manually.');
-  console.error('Use: npx tsx scripts/list-deployments.ts');
-  console.error('Then: npx tsx scripts/close-deployment.ts (after updating the DSEQ)');
+  // Best-effort cleanup: close deployments created in THIS run so we don't
+  // strand billing if a later step fails.
+  await cleanupRunDeployments('cleanup');
+
+  console.error('\nIf any deployments remain active, you can list/close them manually:');
+  console.error('- npx tsx scripts/list-deployments.ts');
+  console.error('- npx tsx scripts/close-deployment.ts <DSEQ>');
   process.exit(1);
 });
