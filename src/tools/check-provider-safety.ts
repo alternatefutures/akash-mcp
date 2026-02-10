@@ -16,7 +16,7 @@ import { createOutput } from '../utils/index.js';
 // - AKASH_SSL_PROXY_PROVIDER
 // - AKASH_SSL_PROXY_PROVIDER_NAME
 //
-// Source of truth: repo root `.github/DEPLOYMENTS.md` (and infrastructure-proxy/deployments.json)
+// Source of truth: repo root `DEPLOYMENTS.md` (and infrastructure-proxy/deployments.json)
 const PROXY_PROVIDER = process.env.AKASH_SSL_PROXY_PROVIDER || 'akash1zlsep362zz46qlwzttm06t8lv9qtg8gtaya97u';
 const PROXY_PROVIDER_NAME = process.env.AKASH_SSL_PROXY_PROVIDER_NAME || 'america.computer';
 

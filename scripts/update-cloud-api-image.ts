@@ -49,7 +49,7 @@ async function main() {
 
   if (!API_DSEQ || !Number.isFinite(API_DSEQ) || !API_PROVIDER) {
     throw new Error(
-      'Missing API_DSEQ / API_PROVIDER. Set them in the environment (see repo-root `.github/DEPLOYMENTS.md`).'
+      'Missing API_DSEQ / API_PROVIDER. Set them in the environment (see repo-root `DEPLOYMENTS.md`).'
     );
   }
 
@@ -68,7 +68,7 @@ async function main() {
   // Without this, the MCP process inside the container fails because:
   // - No cert file on disk (ephemeral container storage)
   // - Can't create a new cert (one already exists on-chain)
-  // See: REDEPLOYMENT-INCIDENT-REPORT.md Phase 12
+  // See: INCIDENTS.md (canonical runbook)
   let akashCertJson = '';
   const certPath = path.resolve(__dirname, '../.local/akash-certs');
   const certFiles = fs.existsSync(certPath)
@@ -84,7 +84,10 @@ async function main() {
 
   console.log(`API DSEQ:       ${API_DSEQ}`);
   console.log(`API Provider:   ${API_PROVIDER}`);
-  console.log(`DATABASE_URL:   ${databaseUrl.substring(0, 24)}...`);
+  // Never print secrets into logs (CI output is often retained).
+  console.log(
+    `DATABASE_URL:   ${databaseUrl.replace(/\/\/([^:]+):([^@]+)@/g, '//$1:<redacted>@')}`
+  );
   console.log(`IPFS_API_URL:   ${ipfsApiUrl}`);
   console.log();
 

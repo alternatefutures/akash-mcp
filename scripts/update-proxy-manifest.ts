@@ -57,7 +57,7 @@ async function main() {
 
   if (!PROXY_DSEQ || !Number.isFinite(PROXY_DSEQ) || !PROXY_PROVIDER) {
     throw new Error(
-      'Missing PROXY_DSEQ / PROXY_PROVIDER. Set them in the environment (see repo-root `.github/DEPLOYMENTS.md`).'
+      'Missing PROXY_DSEQ / PROXY_PROVIDER. Set them in the environment (see repo-root `DEPLOYMENTS.md`).'
     );
   }
 

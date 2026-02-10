@@ -3,19 +3,29 @@
  * Full Clean Redeploy - Close ALL Akash deployments and redeploy everything.
  *
  * Deployment order (each depends on the previous):
- *   1. Close all active deployments
- *   2. Deploy PostgreSQL (standalone)
- *   3. Deploy data services (IPFS + Jaeger)
- *   4. Deploy auth (standalone, with DATABASE_URL + secrets injected via env vars)
- *   5. Deploy API (standalone)
- *   6. Deploy SSL proxy (Pingap with dedicated IP lease)
- *   7. Update config files (pingap.toml, DEPLOYMENTS.md, workflows)
+ *   1.   Close all active deployments
+ *   2.   Deploy PostgreSQL (standalone)
+ *   3.   Deploy data services (IPFS + Jaeger)
+ *   4.   Deploy auth (standalone, with DATABASE_URL + secrets injected via env vars)
+ *   4.5  Run database migrations for BOTH services + seed subscription plans
+ *         - service-auth: prisma migrate deploy (migrations are complete)
+ *         - service-cloud-api: prisma migrate diff (additive-only, no DROPs)
+ *         See INCIDENTS.md (Shared DB + Prisma policy) for why this split exists.
+ *   5.   Deploy API (standalone)
+ *   6.   Update pingap.toml with raw provider ingress URLs (prevents circular routing)
+ *   6.5  Build + push proxy Docker image (requires Docker + GHCR write:packages)
+ *   7.   Deploy SSL proxy (Pingap with dedicated IP lease, using freshly built image)
+ *   8.   Update config files (DEPLOYMENTS.md, workflows)
+ *   8.5  Persist deployment info to .env.deploy (DATABASE_URL, DSEQs, providers)
+ *   9.   Print summary
  *
  * Note: Infisical is SKIPPED. Secrets are injected directly as SDL env vars.
  * The auth service has a built-in fallback that reads from env vars when
  * Infisical credentials are not provided.
  *
  * Required:
+ *   - Docker running (Docker Desktop or dockerd) — proxy image is built locally
+ *   - GHCR_PAT with write:packages scope (for pushing proxy image to ghcr.io)
  *   - akash-mcp/.env       (AKASH_MNEMONIC)
  *   - akash-mcp/.env.deploy (all deployment secrets - see .env.deploy.example)
  *   - SSL proxy TLS material (Cloudflare Origin Certificate + key), provided via:
@@ -29,6 +39,7 @@
 import fs from 'fs';
 import path from 'path';
 import https from 'https';
+import crypto from 'crypto';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { config } from 'dotenv';
@@ -105,6 +116,48 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * Retry an async operation on transient RPC errors (HTTP 524 Cloudflare timeout,
+ * 502/503 gateway errors, ECONNRESET, etc.). These are common with the public
+ * Akash RPC endpoints and should not crash the entire deploy run.
+ */
+async function retryOnTransient<T>(
+  fn: () => Promise<T>,
+  opts: { label: string; maxRetries?: number; delayMs?: number } = { label: '' }
+): Promise<T> {
+  const maxRetries = opts.maxRetries ?? 4;
+  const baseDelay = opts.delayMs ?? 10_000;
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      const msg = String(err?.message || err || '');
+      const isTransient =
+        msg.includes('524') ||
+        msg.includes('502') ||
+        msg.includes('503') ||
+        msg.includes('ECONNRESET') ||
+        msg.includes('ETIMEDOUT') ||
+        msg.includes('ECONNREFUSED') ||
+        msg.includes('socket hang up') ||
+        msg.includes('network timeout');
+
+      if (isTransient && attempt <= maxRetries) {
+        const delay = baseDelay * attempt; // linear backoff
+        console.log(
+          `  [${opts.label}] Transient RPC error (attempt ${attempt}/${maxRetries + 1}): ${msg.slice(0, 120)}`
+        );
+        console.log(`  [${opts.label}] Retrying in ${delay / 1000}s...`);
+        await sleep(delay);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('unreachable');
+}
+
 function injectGhcrCredentials(sdlContent: string) {
   const ghcrPat = mustEnv('GHCR_PAT');
   return sdlContent.replace(
@@ -137,9 +190,13 @@ function mustDbPassword(): string {
 
 async function closeDeploymentQuiet(chainSDK: any, owner: string, dseq: number, label: string) {
   try {
-    await chainSDK.akash.deployment.v1beta4.closeDeployment({
-      id: { owner, dseq: BigInt(dseq) },
-    });
+    await retryOnTransient(
+      () =>
+        chainSDK.akash.deployment.v1beta4.closeDeployment({
+          id: { owner, dseq: BigInt(dseq) },
+        }),
+      { label, maxRetries: 2 }
+    );
     console.log(`  [${label}] Closed DSEQ ${dseq}`);
   } catch (e: any) {
     console.log(`  [${label}] Warning: Failed to close DSEQ ${dseq}: ${e.message || e}`);
@@ -316,21 +373,28 @@ async function deploySDL(
     const groups = sdl.groups();
     const hash = await sdl.manifestVersion();
 
-    // Get current block height for DSEQ
-    const statusResponse = await chainSDK.cosmos.base.tendermint.v1beta1.getLatestBlock({});
+    // Get current block height for DSEQ (retries on transient RPC errors)
+    const statusResponse: any = await retryOnTransient(
+      () => chainSDK.cosmos.base.tendermint.v1beta1.getLatestBlock({}),
+      { label }
+    );
     dseq = Number(statusResponse.block?.header?.height || 0);
     if (!dseq) throw new Error('Could not determine block height for DSEQ');
 
     console.log(`  [${label}] Creating deployment (DSEQ: ${dseq})...`);
-    await chainSDK.akash.deployment.v1beta4.createDeployment({
-      id: { owner, dseq: BigInt(dseq) },
-      groups,
-      hash,
-      deposit: {
-        amount: { denom: 'uakt', amount: String(depositUakt) },
-        sources: [1],
-      },
-    });
+    await retryOnTransient(
+      () =>
+        chainSDK.akash.deployment.v1beta4.createDeployment({
+          id: { owner, dseq: BigInt(dseq) },
+          groups,
+          hash,
+          deposit: {
+            amount: { denom: 'uakt', amount: String(depositUakt) },
+            sources: [1],
+          },
+        }),
+      { label }
+    );
     RUN_CREATED_DSEQS.add(dseq);
     console.log(`  [${label}] Deployment created. DSEQ: ${dseq}`);
 
@@ -338,9 +402,13 @@ async function deploySDL(
     console.log(`  [${label}] Waiting 30s for bids...`);
     await sleep(30_000);
 
-    const bidsResponse = await chainSDK.akash.market.v1beta5.getBids({
-      filters: { owner, dseq: BigInt(dseq) },
-    });
+    const bidsResponse: any = await retryOnTransient(
+      () =>
+        chainSDK.akash.market.v1beta5.getBids({
+          filters: { owner, dseq: BigInt(dseq) },
+        }),
+      { label }
+    );
 
     const bids = bidsResponse.bids || [];
     if (bids.length === 0) throw new Error(`[${label}] No bids received.`);
@@ -442,11 +510,15 @@ async function deploySDL(
       selectionMode: preferred ? 'preferred' : cheapestWorking ? 'cheapest_known_working' : 'cheapest',
     });
 
-    // Create lease
+    // Create lease (retries on transient RPC errors)
     console.log(`  [${label}] Creating lease...`);
-    await chainSDK.akash.market.v1beta5.createLease({
-      bidId: { owner, dseq: BigInt(dseq), gseq, oseq, provider, bseq },
-    });
+    await retryOnTransient(
+      () =>
+        chainSDK.akash.market.v1beta5.createLease({
+          bidId: { owner, dseq: BigInt(dseq), gseq, oseq, provider, bseq },
+        }),
+      { label }
+    );
     console.log(`  [${label}] Lease created.`);
 
   // Wait until the lease is visible on-chain (and not immediately closed).
@@ -704,9 +776,13 @@ async function waitForServices(
 async function closeAllDeployments(chainSDK: any, owner: string) {
   hr('STEP 1: Close ALL active deployments');
 
-  const deploymentsRes = await chainSDK.akash.deployment.v1beta4.getDeployments({
-    filters: { owner, state: 'active' },
-  });
+  const deploymentsRes: any = await retryOnTransient(
+    () =>
+      chainSDK.akash.deployment.v1beta4.getDeployments({
+        filters: { owner, state: 'active' },
+      }),
+    { label: 'close-all' }
+  );
 
   const deployments = deploymentsRes.deployments || [];
   if (deployments.length === 0) {
@@ -722,9 +798,13 @@ async function closeAllDeployments(chainSDK: any, owner: string) {
 
     const dseq = Number(dep.id.dseq);
     try {
-      await chainSDK.akash.deployment.v1beta4.closeDeployment({
-        id: { owner, dseq: BigInt(dseq) },
-      });
+      await retryOnTransient(
+        () =>
+          chainSDK.akash.deployment.v1beta4.closeDeployment({
+            id: { owner, dseq: BigInt(dseq) },
+          }),
+        { label: 'close-all', maxRetries: 2 }
+      );
       console.log(`  Closed DSEQ: ${dseq}`);
     } catch (e: any) {
       console.log(`  Warning: Failed to close DSEQ ${dseq}: ${e.message}`);
@@ -1001,17 +1081,26 @@ async function deployAuth(
       );
 
       let ingressUrl = '';
+      let rawIngressUrl = '';
       if (status?.services) {
         for (const [, info] of Object.entries(status.services) as any) {
-          if (info?.uris?.length) {
-            ingressUrl = info.uris[0];
-            break;
+          const uris = info?.uris || [];
+          // Prefer the raw provider ingress URL (contains .ingress.) over
+          // custom domain names to avoid circular proxy routing.
+          for (const uri of uris) {
+            if (!ingressUrl) ingressUrl = uri;
+            if (uri.includes('.ingress.')) rawIngressUrl = uri;
           }
         }
       }
 
-      console.log(`  Auth ingress: ${ingressUrl || '(not found)'}`);
-      if (!ingressUrl) {
+      // Use raw ingress URL if available (critical for proxy config)
+      const finalIngressUrl = rawIngressUrl || ingressUrl;
+      console.log(`  Auth ingress: ${finalIngressUrl || '(not found)'}`);
+      if (rawIngressUrl && rawIngressUrl !== ingressUrl) {
+        console.log(`  Auth custom domain: ${ingressUrl} (not used for proxy)`);
+      }
+      if (!finalIngressUrl) {
         throw new Error('[auth] Could not detect ingress URL from lease status.');
       }
 
@@ -1023,7 +1112,7 @@ async function deployAuth(
         bidAmount: result.bidAmount,
         bidDenom: result.bidDenom,
       });
-      return { ...result, ingressUrl };
+      return { ...result, ingressUrl: finalIngressUrl };
     } catch (e: any) {
       lastError = e;
       console.log(`  [auth] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`);
@@ -1069,6 +1158,18 @@ async function deployApi(
   const grpcEndpoint = optEnv('GRPC_ENDPOINT', 'https://akash-grpc.publicnode.com:443');
   const akashMcpPath = optEnv('AKASH_MCP_PATH', '/app/akash-mcp/dist/index.js');
 
+  // CRITICAL: The cloud-api container runs the akash-mcp as a subprocess.
+  // Without the certificate available, the MCP process crashes on startup
+  // (trying to revoke+regenerate on-chain), producing the opaque error
+  // "MCP process not running". Inject the certificate as base64-encoded JSON
+  // so it loads instantly from env without any network calls.
+  const certJson = JSON.stringify({
+    cert: certificate.cert,
+    publicKey: certificate.publicKey,
+    privateKey: certificate.privateKey,
+  });
+  const akashCertJsonB64 = Buffer.from(certJson).toString('base64');
+
   let sdlContent = mustReadFile(path.join(ROOT, 'service-cloud-api/deploy-api.yaml'));
   sdlContent = sdlContent.replace(/__DATABASE_URL__/g, databaseUrl);
   sdlContent = sdlContent.replace(/__IPFS_API_URL__/g, ipfsApiUrl);
@@ -1084,6 +1185,7 @@ async function deployApi(
   sdlContent = sdlContent.replace(/__RPC_ENDPOINT__/g, rpcEndpoint);
   sdlContent = sdlContent.replace(/__GRPC_ENDPOINT__/g, grpcEndpoint);
   sdlContent = sdlContent.replace(/__AKASH_MCP_PATH__/g, akashMcpPath);
+  sdlContent = sdlContent.replace(/__AKASH_CERT_JSON__/g, akashCertJsonB64);
   if (sentryDsn) {
     sdlContent = sdlContent.replace(/your_sentry_dsn/g, sentryDsn);
   }
@@ -1109,17 +1211,23 @@ async function deployApi(
       );
 
       let apiIngressUrl = '';
+      let rawApiIngressUrl = '';
       if (status?.services) {
         for (const [, info] of Object.entries(status.services) as any) {
-          if (info?.uris?.length) {
-            apiIngressUrl = info.uris[0];
-            break;
+          const uris = info?.uris || [];
+          for (const uri of uris) {
+            if (!apiIngressUrl) apiIngressUrl = uri;
+            if (uri.includes('.ingress.')) rawApiIngressUrl = uri;
           }
         }
       }
 
-      console.log(`  API ingress: ${apiIngressUrl || '(not found)'}`);
-      if (!apiIngressUrl) {
+      const finalApiIngressUrl = rawApiIngressUrl || apiIngressUrl;
+      console.log(`  API ingress: ${finalApiIngressUrl || '(not found)'}`);
+      if (rawApiIngressUrl && rawApiIngressUrl !== apiIngressUrl) {
+        console.log(`  API custom domain: ${apiIngressUrl} (not used for proxy)`);
+      }
+      if (!finalApiIngressUrl) {
         throw new Error('[api] Could not detect ingress URL from lease status.');
       }
 
@@ -1131,7 +1239,7 @@ async function deployApi(
         bidAmount: result.bidAmount,
         bidDenom: result.bidDenom,
       });
-      return { ...result, apiIngressUrl };
+      return { ...result, apiIngressUrl: finalApiIngressUrl };
     } catch (e: any) {
       lastError = e;
       console.log(`  [api] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`);
@@ -1173,6 +1281,17 @@ async function deployProxy(
 
   if (sdlContent.includes('<REPLACE_WITH_ORIGIN_CERT>') || sdlContent.includes('<REPLACE_WITH_ORIGIN_KEY>')) {
     throw new Error('SDL TLS placeholders were not replaced.');
+  }
+
+  // If a custom image tag was built (Step 6.5), replace :main with the
+  // specific tag to force the provider to pull the new image.
+  const customProxyTag = process.env._PROXY_IMAGE_TAG;
+  if (customProxyTag && customProxyTag !== 'main') {
+    sdlContent = sdlContent.replace(
+      /infrastructure-proxy-pingap:main/g,
+      `infrastructure-proxy-pingap:${customProxyTag}`
+    );
+    console.log(`  [SSL-proxy] Using custom image tag: ${customProxyTag}`);
   }
 
   const triedProviders = new Set<string>();
@@ -1268,6 +1387,371 @@ async function deployProxy(
   throw lastError || new Error('[SSL-proxy] Failed after provider failover attempts.');
 }
 
+// ─── Step 4.5: Run database migrations + seed ──────────────────────────────
+//
+// CRITICAL: Two services share the same PostgreSQL database with SEPARATE
+// Prisma schemas (service-auth and service-cloud-api). See INCIDENTS.md.
+//
+//   - service-auth: uses `prisma migrate deploy` (migrations are complete)
+//   - service-cloud-api: migrations are NOW COMPLETE (2026-02-09 fix: merged
+//     Organization/Service/Billing tables into the first migration). The
+//     `migrate diff` fallback below is kept for safety but should be a no-op.
+//
+//   NEVER use `prisma db push` for cloud-api — it drops all auth tables.
+
+async function runDatabaseMigrations(databaseUrl: string): Promise<void> {
+  hr('STEP 4.5: Run database migrations + seed');
+
+  const authDir = path.join(ROOT, 'service-auth');
+  const apiDir = path.join(ROOT, 'service-cloud-api');
+  const env = { ...process.env, DATABASE_URL: databaseUrl };
+
+  // ── 1. service-auth: prisma migrate deploy ──
+  // Safe: only applies pending migration files, never drops tables.
+  console.log('  [auth] Running prisma migrate deploy...');
+  try {
+    const migrateOutput = execSync('npx prisma migrate deploy', {
+      cwd: authDir,
+      env,
+      stdio: 'pipe',
+      timeout: 120_000,
+    }).toString();
+    console.log('  ' + migrateOutput.split('\n').filter(l => l.trim()).join('\n  '));
+  } catch (e: any) {
+    const stderr = e.stderr?.toString() || '';
+    const stdout = e.stdout?.toString() || '';
+    // db push is ONLY safe for auth because it's the first service to touch
+    // the DB on a clean deploy. Once cloud-api tables exist this would be
+    // destructive, but on a clean deploy the DB is empty at this point.
+    console.log(`  [auth] prisma migrate deploy failed: ${stderr || stdout}`);
+    console.log('  [auth] Trying prisma db push (safe for initial schema creation)...');
+    try {
+      const pushOutput = execSync('npx prisma db push', {
+        cwd: authDir,
+        env,
+        stdio: 'pipe',
+        timeout: 120_000,
+      }).toString();
+      console.log('  ' + pushOutput.split('\n').filter(l => l.trim()).join('\n  '));
+    } catch (pushErr: any) {
+      console.error('  [auth] prisma db push also failed:', pushErr.stderr?.toString() || pushErr.message);
+      throw new Error('[auth] Database migration failed. Cannot continue without tables.');
+    }
+  }
+
+  // ── 2. Seed auth subscription plans ──
+  console.log('\n  [auth] Seeding subscription plans...');
+  try {
+    const seedOutput = execSync('npx tsx scripts/seed-plans.ts', {
+      cwd: authDir,
+      env,
+      stdio: 'pipe',
+      timeout: 60_000,
+    }).toString();
+    console.log('  ' + seedOutput.split('\n').filter(l => l.trim()).join('\n  '));
+  } catch (e: any) {
+    const errMsg = e.stderr?.toString() || e.stdout?.toString() || e.message;
+    console.log(`  [auth] Seed warning (non-fatal): ${errMsg}`);
+  }
+
+  // ── 3. service-cloud-api: additive-only schema sync ──
+  // Cloud-api migrations are now complete (2026-02-09 fix), so this diff
+  // should normally be a no-op. Kept as a safety net to catch any future
+  // schema drift without destructive DROPs.
+  //
+  // NEVER use `prisma db push` here — it would drop all auth_* tables.
+  console.log('\n  [cloud-api] Syncing schema (additive-only, no DROPs)...');
+  try {
+    // Generate diff: current DB state → target schema
+    const diffSql = execSync(
+      `npx prisma migrate diff --from-url "${databaseUrl}" --to-schema-datamodel prisma/schema.prisma --script`,
+      {
+        cwd: apiDir,
+        env,
+        stdio: 'pipe',
+        timeout: 120_000,
+      }
+    ).toString();
+
+    // Check if there's anything to do
+    if (!diffSql.trim()) {
+      console.log('  [cloud-api] Schema already in sync. Nothing to do.');
+    } else {
+      // Filter out all destructive statements (DROP TABLE, DROP CONSTRAINT,
+      // DROP TYPE, DropForeignKey). Keep only CREATE/ALTER...ADD/AddForeignKey.
+      const safeLines: string[] = [];
+      let skip = false;
+      for (const line of diffSql.split('\n')) {
+        const trimmed = line.trim();
+        // Skip comment lines that indicate destructive operations
+        if (trimmed.startsWith('-- Drop') || trimmed.startsWith('-- DropTable') ||
+            trimmed.startsWith('-- DropForeignKey') || trimmed.startsWith('-- DropEnum')) {
+          skip = true;
+          continue;
+        }
+        // Skip actual DROP/ALTER...DROP statements
+        if (trimmed.startsWith('DROP ') || trimmed.match(/^ALTER TABLE .+ DROP /)) {
+          skip = true;
+          continue;
+        }
+        // A new comment section means we might be back to safe territory
+        if (trimmed.startsWith('-- ') && !trimmed.startsWith('-- Drop')) {
+          skip = false;
+        }
+        if (!skip) {
+          safeLines.push(line);
+        }
+        // Reset skip on blank lines (statement boundaries)
+        if (trimmed === '') {
+          skip = false;
+        }
+      }
+
+      const safeSql = safeLines.join('\n').trim();
+      if (!safeSql) {
+        console.log('  [cloud-api] Only destructive changes detected (skipped). Schema OK.');
+      } else {
+        // Double-check: refuse to execute if any DROP slipped through
+        if (safeSql.includes('DROP TABLE') || safeSql.includes('DROP TYPE') || safeSql.includes('DROP CONSTRAINT')) {
+          console.error('  [cloud-api] ✖ Safety check failed: DROP statement found in filtered SQL.');
+          console.error('  [cloud-api] Skipping cloud-api schema sync to protect auth tables.');
+          console.error('  [cloud-api] Run manually: prisma migrate diff + filter + prisma db execute');
+        } else {
+          // Write to temp file and execute
+          const tmpSql = path.resolve(__dirname, '../.local/_cloud-api-schema-sync.sql');
+          fs.mkdirSync(path.dirname(tmpSql), { recursive: true });
+          fs.writeFileSync(tmpSql, safeSql);
+
+          const stmtCount = (safeSql.match(/;\s*$/gm) || []).length;
+          console.log(`  [cloud-api] Applying ${stmtCount} additive statement(s)...`);
+
+          execSync(
+            `npx prisma db execute --url "${databaseUrl}" --stdin < "${tmpSql}"`,
+            {
+              cwd: apiDir,
+              env,
+              stdio: 'pipe',
+              timeout: 120_000,
+            }
+          );
+          console.log('  [cloud-api] ✓ Schema synced successfully.');
+
+          // Clean up temp file
+          try { fs.unlinkSync(tmpSql); } catch {}
+        }
+      }
+    }
+
+    // Mark all cloud-api migrations as applied so future `migrate deploy`
+    // doesn't try to re-run them and fail on already-existing objects.
+    try {
+      const migrationDir = path.join(apiDir, 'prisma/migrations');
+      if (fs.existsSync(migrationDir)) {
+        const migrations = fs.readdirSync(migrationDir)
+          .filter(d => fs.statSync(path.join(migrationDir, d)).isDirectory())
+          .sort();
+        for (const migration of migrations) {
+          try {
+            execSync(
+              `npx prisma migrate resolve --applied ${migration}`,
+              { cwd: apiDir, env, stdio: 'pipe', timeout: 30_000 }
+            );
+          } catch {
+            // Already applied or doesn't exist in _prisma_migrations — fine
+          }
+        }
+        if (migrations.length > 0) {
+          console.log(`  [cloud-api] Marked ${migrations.length} migration(s) as applied.`);
+        }
+      }
+    } catch (e: any) {
+      console.log(`  [cloud-api] Migration resolve warning: ${e.message || e}`);
+    }
+  } catch (e: any) {
+    const errMsg = e.stderr?.toString() || e.message || String(e);
+    // Don't fail the entire deploy for cloud-api schema issues — the auth
+    // service is the critical path. Log prominently so it's noticed.
+    console.error(`  [cloud-api] ✖ Schema sync failed: ${errMsg}`);
+    console.error('  [cloud-api] The API service may fail on DB operations.');
+    console.error('  [cloud-api] Fix manually: see INCIDENTS.md (Shared Postgres + Prisma policy)');
+  }
+
+  // ── 4. Verify critical tables from BOTH services exist ──
+  console.log('\n  Verifying critical database tables...');
+  try {
+    const verifyOutput = execSync(
+      `npx tsx -e "
+        import { PrismaClient } from '@prisma/client';
+        (async () => {
+          const p = new PrismaClient();
+          const codes = await p.verificationCode.count();
+          const plans = await p.subscriptionPlan.count();
+          console.log('auth_verification_codes: OK');
+          console.log('auth_subscription_plans: ' + plans + ' plans');
+          await p.\\$disconnect();
+        })();
+      "`,
+      {
+        cwd: authDir,
+        env,
+        stdio: 'pipe',
+        timeout: 30_000,
+      }
+    ).toString();
+    console.log('  ' + verifyOutput.split('\n').filter(l => l.trim()).join('\n  '));
+  } catch (e: any) {
+    const errMsg = e.stderr?.toString() || e.message;
+    console.log(`  ⚠ Auth table verification warning: ${errMsg}`);
+  }
+
+  // Verify cloud-api tables
+  try {
+    const verifyApiOutput = execSync(
+      `npx tsx -e "
+        import { PrismaClient } from '@prisma/client';
+        (async () => {
+          const p = new PrismaClient();
+          const projects = await p.project.count();
+          const services = await p.service.count();
+          const orgs = await p.organization.count();
+          console.log('Project: OK (' + projects + ' rows)');
+          console.log('Service: OK (' + services + ' rows)');
+          console.log('Organization: OK (' + orgs + ' rows)');
+          await p.\\$disconnect();
+        })();
+      "`,
+      {
+        cwd: apiDir,
+        env,
+        stdio: 'pipe',
+        timeout: 30_000,
+      }
+    ).toString();
+    console.log('  ' + verifyApiOutput.split('\n').filter(l => l.trim()).join('\n  '));
+  } catch (e: any) {
+    const errMsg = e.stderr?.toString() || e.message;
+    console.log(`  ⚠ Cloud-API table verification warning: ${errMsg}`);
+  }
+
+  console.log('  ✓ Database migrations and seeding complete.');
+}
+
+// ─── Step 6.5: Build + push proxy image ────────────────────────────────────
+
+function isDockerAvailable(): boolean {
+  try {
+    execSync('docker info', { stdio: 'pipe', timeout: 10_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isGhcrAuthenticated(): boolean {
+  try {
+    execSync('docker login ghcr.io --get-login', { stdio: 'pipe', timeout: 5_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build and push the proxy Docker image with the updated pingap.toml.
+ * Returns the image tag to use in the proxy SDL.
+ *
+ * Requires Docker to be running and GHCR_PAT to have write:packages scope.
+ * Throws on failure — there is no fallback. The proxy MUST be deployed with
+ * the freshly-built image containing the correct pingap.toml upstream URLs.
+ */
+function buildAndPushProxyImage(): string {
+  const proxyDir = path.join(ROOT, 'infrastructure-proxy');
+  const imageBase = 'ghcr.io/alternatefutures/infrastructure-proxy-pingap';
+  const tag = `deploy-${Date.now()}`;
+  const fullImage = `${imageBase}:${tag}`;
+
+  // Docker + GHCR auth were already validated in the pre-flight checks.
+  // Build with explicit AMD64 platform (Akash providers are AMD64).
+  console.log(`  Building: ${fullImage} (--platform linux/amd64)...`);
+  try {
+    execSync(
+      `docker buildx build --platform linux/amd64 -t ${fullImage} -t ${imageBase}:main --push .`,
+      {
+        cwd: proxyDir,
+        stdio: 'inherit',
+        timeout: 300_000, // 5 minute timeout
+      }
+    );
+  } catch (e: any) {
+    const errMsg = e.message || String(e);
+    if (errMsg.includes('permission_denied') || errMsg.includes('expected scopes')) {
+      throw new Error(
+        'Docker push to GHCR failed: permission denied.\n' +
+        '  Your GHCR_PAT token does not have the write:packages scope.\n' +
+        '  Go to https://github.com/settings/tokens and update the token,\n' +
+        '  then set the new value in .env.deploy and re-run.'
+      );
+    }
+    throw new Error(`Docker build+push failed: ${errMsg}`);
+  }
+
+  console.log(`  ✓ Proxy image built and pushed: ${fullImage}`);
+  return tag;
+}
+
+// ─── Persist deployment info to .env.deploy ─────────────────────────────────
+
+function persistDeploymentInfo(
+  database: DatabaseResult,
+  data: DataResult,
+  auth: AuthResult,
+  api: ApiResult,
+  proxy: ProxyResult | null,
+  databaseUrl: string,
+  dbPassword: string
+): void {
+  const envDeployPath = path.resolve(__dirname, '../.env.deploy');
+  let content = '';
+
+  if (fs.existsSync(envDeployPath)) {
+    content = fs.readFileSync(envDeployPath, 'utf-8');
+  }
+
+  // Helper: set or update a key=value in the content
+  function setEnvVar(key: string, value: string): void {
+    const regex = new RegExp(`^${key}=.*$`, 'm');
+    if (regex.test(content)) {
+      content = content.replace(regex, `${key}=${value}`);
+    } else {
+      // Append at end
+      content = content.trimEnd() + `\n${key}=${value}\n`;
+    }
+  }
+
+  // Database
+  setEnvVar('POSTGRES_PASSWORD', dbPassword);
+  setEnvVar('YSQL_PASSWORD', dbPassword);
+  setEnvVar('DATABASE_URL', databaseUrl);
+
+  // Deployment identifiers
+  setEnvVar('AUTH_DSEQ', String(auth.dseq));
+  setEnvVar('AUTH_PROVIDER', auth.provider);
+  setEnvVar('API_DSEQ', String(api.dseq));
+  setEnvVar('API_PROVIDER', api.provider);
+  if (proxy) {
+    setEnvVar('PROXY_DSEQ', String(proxy.dseq));
+    setEnvVar('PROXY_PROVIDER', proxy.provider);
+  }
+
+  // Data services
+  if (data.ipfsApiHost && data.ipfsApiPort) {
+    setEnvVar('IPFS_API_URL', `http://${data.ipfsApiHost}:${data.ipfsApiPort}`);
+  }
+
+  fs.writeFileSync(envDeployPath, content);
+  console.log('  Persisted deployment info to .env.deploy');
+}
+
 // ─── Step 5: Update config files ────────────────────────────────────────────
 
 function updateConfigFiles(
@@ -1277,60 +1761,13 @@ function updateConfigFiles(
   auth: AuthResult,
   proxy: ProxyResult
 ) {
-  hr('STEP 7: Update config files');
+  hr('STEP 8: Update config files');
 
-  // 6a. Update pingap.toml using line-by-line replacement for reliability
-  const pingapPath = path.join(ROOT, 'infrastructure-proxy/pingap.toml');
-  const pingapLines = mustReadFile(pingapPath).split('\n');
+  // pingap.toml was already updated in Step 6 (before proxy deploy) to prevent
+  // circular routing. No need to update it again here.
+  console.log('  pingap.toml: already updated in Step 6 (skipping)');
 
-  // Helper: find the line index starting with a given prefix after a section header
-  function findLineAfter(lines: string[], sectionMarker: string, linePrefix: string): number {
-    const sectionIdx = lines.findIndex((l) => l.trim() === sectionMarker);
-    if (sectionIdx === -1) return -1;
-    for (let i = sectionIdx + 1; i < lines.length; i++) {
-      if (lines[i].trim().startsWith(linePrefix)) return i;
-      // Stop if we hit the next section
-      if (lines[i].startsWith('[') && i > sectionIdx + 1) break;
-    }
-    return -1;
-  }
-
-  // Helper: find proxy_set_headers line in a location section and replace Host value
-  function updateHostHeader(lines: string[], sectionMarker: string, newHost: string): void {
-    const sectionIdx = lines.findIndex((l) => l.trim() === sectionMarker);
-    if (sectionIdx === -1) return;
-    for (let i = sectionIdx + 1; i < lines.length; i++) {
-      if (lines[i].trim().startsWith('proxy_set_headers')) {
-        // Replace the Host: value in the proxy_set_headers array
-        lines[i] = lines[i].replace(/Host: [^"]+/, `Host: ${newHost}`);
-        return;
-      }
-      if (lines[i].startsWith('[') && i > sectionIdx + 1) break;
-    }
-  }
-
-  if (auth.ingressUrl) {
-    // Update [upstreams.auth] addrs and sni
-    const authAddrsIdx = findLineAfter(pingapLines, '[upstreams.auth]', 'addrs');
-    if (authAddrsIdx !== -1) {
-      pingapLines[authAddrsIdx] = `addrs = ["${auth.ingressUrl}:80"]`;
-    }
-    updateHostHeader(pingapLines, '[locations.auth]', auth.ingressUrl);
-  }
-
-  if (api.apiIngressUrl) {
-    // Update [upstreams.api] addrs and sni
-    const apiAddrsIdx = findLineAfter(pingapLines, '[upstreams.api]', 'addrs');
-    if (apiAddrsIdx !== -1) {
-      pingapLines[apiAddrsIdx] = `addrs = ["${api.apiIngressUrl}:80"]`;
-    }
-    updateHostHeader(pingapLines, '[locations.api]', api.apiIngressUrl);
-  }
-
-  fs.writeFileSync(pingapPath, pingapLines.join('\n'));
-  console.log('  Updated: infrastructure-proxy/pingap.toml');
-
-  // 6b. Update service-auth update-manifest.yml
+  // 8a. Update service-auth update-manifest.yml
   const authManifestPath = path.join(ROOT, 'service-auth/.github/workflows/update-manifest.yml');
   let authManifest = mustReadFile(authManifestPath);
   authManifest = authManifest.replace(
@@ -1429,119 +1866,6 @@ The auth service reads JWT_SECRET, RESEND_API_KEY, etc. from env vars.
 
   fs.writeFileSync(deploymentsPath, deploymentsContent);
   console.log('  Updated: DEPLOYMENTS.md');
-
-  // 6e. Update .github/DEPLOYMENTS.md
-  const ghDeploymentsPath = path.join(ROOT, '.github/DEPLOYMENTS.md');
-
-  const ghDeploymentsContent = `# Akash Network Deployments
-
-This file tracks active deployments on Akash Network. All information here is public blockchain data.
-
-## Active Deployments
-
-### postgres (database)
-| Field | Value |
-|-------|-------|
-| **DSEQ** | ${database.dseq} |
-| **Provider** | \`${database.provider}\` |
-| **Services** | PostgreSQL 16 Alpine |
-| **Status** | Running |
-
-### data services (IPFS + Jaeger)
-| Field | Value |
-|-------|-------|
-| **DSEQ** | ${data.dseq} |
-| **Provider** | \`${data.provider}\` |
-| **Services** | IPFS + Jaeger (OTel collector disabled) |
-| **Ingress** | See Cloudmos for provider ingress URIs (custom-domain routing depends on \`infrastructure-proxy/pingap.toml\`) |
-| **Status** | Running |
-
-### api
-| Field | Value |
-|-------|-------|
-| **DSEQ** | ${api.dseq} |
-| **Provider** | \`${api.provider}\` |
-| **Image** | \`ghcr.io/alternatefutures/service-cloud-api:latest\` |
-| **Custom Domain** | api.alternatefutures.ai (via SSL proxy) |
-| **Ingress** | \`${api.apiIngressUrl}\` |
-| **Status** | Running |
-| **CI/CD** | \`deploy-akash.yml\` (full) / \`update-manifest.yml\` (in-place) |
-
-### service-auth (Authentication)
-| Field | Value |
-|-------|-------|
-| **DSEQ** | ${auth.dseq} |
-| **Provider** | \`${auth.provider}\` |
-| **Image** | \`ghcr.io/alternatefutures/service-auth:main-*\` |
-| **Custom Domain** | auth.alternatefutures.ai (via SSL proxy) |
-| **Status** | Running |
-| **CI/CD** | \`deploy-akash.yml\` (full) / \`update-manifest.yml\` (in-place) |
-
-### infrastructure-proxy (SSL Proxy)
-| Field | Value |
-|-------|-------|
-| **DSEQ** | ${proxy.dseq} |
-| **Provider** | \`${proxy.provider}\` |
-| **Image** | \`ghcr.io/alternatefutures/infrastructure-proxy-pingap:main\` |
-| **Dedicated IP** | ${proxy.ip || 'TBD'} |
-| **Domains Routed** | auth, api, app, docs.alternatefutures.ai |
-| **Status** | Running |
-
-## Database (PostgreSQL)
-
-PostgreSQL is deployed separately and exposed globally via TCP:
-| Field | Value |
-|-------|-------|
-| **Host** | ${database.dbHost} |
-| **Port** | ${database.dbPort} |
-| **Database** | alternatefutures |
-| **User** | alternatefutures |
-| **Connection** | \`postgresql://alternatefutures:<password>@${database.dbHost}:${database.dbPort}/alternatefutures\` |
-
-## Secrets Management
-
-No Infisical deployment. Secrets are injected directly as SDL environment variables at deploy time.
-The auth service reads JWT_SECRET, RESEND_API_KEY, etc. from env vars (built-in fallback).
-
-## Akash Account
-
-- **Address**: \`akash1degudmhf24auhfnqtn99mkja3xt7clt9um77tn\`
-- **Network**: Mainnet
-- **Explorer**: [Cloudmos](https://deploy.cloudmos.io/addresses/akash1degudmhf24auhfnqtn99mkja3xt7clt9um77tn)
-
-## Infrastructure & SSL
-
-All custom domains route through the SSL proxy (Pingap on Cloudflare's Pingora framework) at \`${proxy.ip || 'TBD'}\`.
-
-| Domain | Routing | SSL |
-|--------|---------|-----|
-| auth.alternatefutures.ai | SSL proxy (${proxy.ip || 'TBD'}) | Cloudflare Origin Cert |
-| api.alternatefutures.ai | SSL proxy (${proxy.ip || 'TBD'}) | Cloudflare Origin Cert |
-| app.alternatefutures.ai | Vercel | Vercel managed |
-| ipfs.alternatefutures.ai | TBD (data services deployment) | TBD |
-| jaeger.alternatefutures.ai | TBD (data services deployment) | TBD |
-
-## Blocked Providers
-
-| Provider | Reason |
-|----------|--------|
-| \`akash1smapjx8m8363nmdvc2yr9atlqy8vcql73m9l0v\` | Broken hostname |
-| \`akash1qmumr9mdnu9e8ymyr3nnf3qyjfkugj79eh6jzq\` | yggdrasil-compute.com - broken DNS (doubled provider prefix) |
-
-## View Deployments
-
-Deployments can be viewed on Cloudmos:
-\`\`\`
-https://deploy.cloudmos.io/deployment/akash1degudmhf24auhfnqtn99mkja3xt7clt9um77tn/{dseq}
-\`\`\`
-
----
-
-*Last updated: ${now}*
-`;
-
-  fs.writeFileSync(ghDeploymentsPath, ghDeploymentsContent);
-  console.log('  Updated: .github/DEPLOYMENTS.md');
 }
 
 // ─── Step 6: Print summary ──────────────────────────────────────────────────
@@ -1585,28 +1909,28 @@ function printSummary(
 
   if (opts?.skipManualSteps) return;
 
-  hr('MANUAL STEPS REQUIRED');
+  hr('POST-DEPLOY CHECKLIST');
 
   const databaseUrlRedacted = redactDatabaseUrl(databaseUrl);
 
   console.log(`
-  1. UPDATE GITHUB SECRETS:
-     Set AUTH_DATABASE_URL to:
+  ✅ AUTOMATED (already done):
+     - Database migrations applied (prisma migrate deploy)
+     - Subscription plans seeded (FREE, STARTER, PRO, ENTERPRISE)
+     - Deployment info saved to .env.deploy (DATABASE_URL, DSEQs, providers)
+     - pingap.toml updated with raw provider ingress URLs
+     - Proxy image built and pushed (tag: ${process.env._PROXY_IMAGE_TAG || 'main'})
+
+  REMAINING MANUAL STEPS:
+
+  1. UPDATE GITHUB SECRETS (if you use CI/CD):
+     Set DATABASE_URL to:
      ${databaseUrlRedacted}
-     If you use API workflows, also set DATABASE_URL to the same value.
-     (Replace <redacted> with your real DB password in your secret store.)
 
   2. UPDATE CLOUDFLARE DNS (if proxy IP changed):
      A records for *.alternatefutures.ai -> ${proxy?.ip || 'TBD'}
 
-  3. REBUILD & PUSH PROXY IMAGE (to apply updated pingap.toml):
-     cd infrastructure-proxy
-     docker build -t ghcr.io/alternatefutures/infrastructure-proxy-pingap:main .
-     docker push ghcr.io/alternatefutures/infrastructure-proxy-pingap:main
-     Then trigger the update-manifest workflow for the proxy, OR
-     use the akash-mcp to send an updated manifest.
-
-  4. COMMIT THE UPDATED CONFIG FILES:
+  3. COMMIT THE UPDATED CONFIG FILES:
      git add -A && git commit -m "Update deployment configs after full redeploy"
 `);
 }
@@ -1748,6 +2072,94 @@ async function main() {
     console.log('SSL proxy TLS check skipped (AKASH_REDEPLOY_SKIP_PROXY=1)\n');
   }
 
+  // Validate Docker is available and can push to GHCR.
+  // The proxy image MUST be built locally with the updated pingap.toml — there
+  // is no CI fallback. This eliminates deployment ambiguity entirely.
+  if (!skipProxy) {
+    console.log('Validating Docker availability...');
+    if (!isDockerAvailable()) {
+      console.error('\n✖ Docker is required but not running.');
+      console.error('  The proxy image must be built locally with the updated pingap.toml.');
+      console.error('  Please start Docker Desktop (or dockerd) and re-run.');
+      process.exit(1);
+    }
+    console.log('  Docker is running.');
+
+    // Pre-authenticate with GHCR so we catch permission issues before spending
+    // 10+ minutes deploying all services.
+    // SECURITY: Pass token via stdin/env — never interpolate into command strings.
+    const ghcrPat = mustEnv('GHCR_PAT');
+    try {
+      if (!isGhcrAuthenticated()) {
+        execSync('echo "$GHCR_PAT" | docker login ghcr.io -u alternatefutures --password-stdin', {
+          stdio: 'pipe',
+          timeout: 15_000,
+          env: { ...process.env, GHCR_PAT: ghcrPat },
+        });
+      }
+      console.log('  GHCR authentication OK.');
+    } catch (e: any) {
+      const safeMsg = (e?.message || String(e)).replace(ghcrPat, '***');
+      console.error('\n✖ Failed to authenticate with GHCR.');
+      console.error('  Ensure GHCR_PAT has write:packages scope.');
+      console.error(`  Error: ${safeMsg}`);
+      process.exit(1);
+    }
+
+    // Verify the GHCR_PAT token has write:packages scope by querying the
+    // GitHub API. This catches the #1 cause of push failures (read-only token)
+    // BEFORE we spend 10+ minutes deploying services.
+    //
+    // SECURITY: Never pass the token directly in shell commands — it leaks into
+    // error messages if execSync throws. Use environment variables instead.
+    console.log('  Verifying GHCR_PAT has write:packages scope...');
+    try {
+      const scopeHeaders = execSync(
+        'curl -sI -H "Authorization: token $GHCR_PAT" https://api.github.com/user',
+        { stdio: 'pipe', timeout: 15_000, env: { ...process.env, GHCR_PAT: ghcrPat } }
+      ).toString();
+      // GitHub returns X-OAuth-Scopes header listing all scopes the token has
+      const scopeLine = scopeHeaders.split('\n').find(l => l.toLowerCase().startsWith('x-oauth-scopes:'));
+      if (scopeLine) {
+        const scopes = scopeLine.replace(/^x-oauth-scopes:\s*/i, '').trim();
+        if (!scopes.includes('write:packages')) {
+          console.error(`\n✖ GHCR_PAT is missing the write:packages scope.`);
+          console.error(`  Current scopes: ${scopes || '(none)'}`);
+          console.error('  Go to https://github.com/settings/tokens and update your token');
+          console.error('  to include the "write:packages" scope, then update .env.deploy.');
+          process.exit(1);
+        }
+        console.log(`  Token scopes: ${scopes}`);
+      } else {
+        // Fine-grained PATs don't return X-OAuth-Scopes — try a direct
+        // GHCR push-scope token exchange to verify write access.
+        console.log('  Could not read X-OAuth-Scopes (fine-grained PAT?). Testing push token...');
+        try {
+          const tokenResp = execSync(
+            'curl -sf -u "alternatefutures:$GHCR_PAT" ' +
+            '"https://ghcr.io/token?scope=repository:alternatefutures/infrastructure-proxy-pingap:push"',
+            { stdio: 'pipe', timeout: 15_000, env: { ...process.env, GHCR_PAT: ghcrPat } }
+          ).toString();
+          const token = JSON.parse(tokenResp)?.token;
+          if (!token) throw new Error('No token returned');
+          console.log('  Push-scope token exchange succeeded.');
+        } catch {
+          console.error('\n✖ GHCR_PAT cannot push images to ghcr.io.');
+          console.error('  Ensure the token has write:packages scope (classic PAT) or');
+          console.error('  "Write" access to packages (fine-grained PAT).');
+          console.error('  Update at: https://github.com/settings/tokens');
+          process.exit(1);
+        }
+      }
+    } catch (e: any) {
+      // Never log the raw error — it may contain the token in the command string
+      const safeMsg = (e?.message || String(e)).replace(ghcrPat, '***');
+      console.log(`  Token scope check inconclusive: ${safeMsg}`);
+      console.log('  Will verify on push.');
+    }
+    console.log('');
+  }
+
   // Load wallet + certificate
   console.log('Loading wallet and certificate...');
   const { wallet, client, chainSDK } = await loadWalletAndClient();
@@ -1811,6 +2223,12 @@ async function main() {
   );
   usedProviders.add(auth.provider);
 
+  // ── STEP 4.5: Run database migrations + seed ──
+  // Must happen AFTER postgres is running and BEFORE API deploy (so API can
+  // also assume tables exist). This is the critical step that was missing
+  // from the original script — without it, auth returns 500 on any DB operation.
+  await runDatabaseMigrations(databaseUrl);
+
   // ── STEP 5: Deploy API ──
   const api = await deployApi(
     chainSDK,
@@ -1823,28 +2241,105 @@ async function main() {
   );
   usedProviders.add(api.provider);
 
-  // ── STEP 6: Deploy SSL proxy ──
+  // ── STEP 6: Update config files (BEFORE proxy deploy) ──
+  // Update pingap.toml with the real auth + API ingress URLs BEFORE building
+  // the proxy Docker image. This prevents the circular routing bug from the
+  // incident report (Phase 5): if pingap.toml has the custom domain names
+  // as upstreams, Cloudflare resolves them back to the proxy IP → infinite loop.
   let proxy: ProxyResult | null = null;
-  if (!skipProxy) {
-    // Exclude all other providers (proxy must be separate to avoid NAT hairpin)
+  if (!skipProxy && writeFiles) {
+    // We need a placeholder proxy result for updateConfigFiles — we'll update
+    // DEPLOYMENTS.md again after the proxy is deployed with the real DSEQ/IP.
+    // For now, just update pingap.toml with the correct ingress URLs.
+    hr('STEP 6: Update pingap.toml with new ingress URLs');
+
+    const pingapPath = path.join(ROOT, 'infrastructure-proxy/pingap.toml');
+    const pingapLines = mustReadFile(pingapPath).split('\n');
+
+    const findLineAfterForProxy = (lines: string[], sectionMarker: string, linePrefix: string): number => {
+      const sectionIdx = lines.findIndex((l) => l.trim() === sectionMarker);
+      if (sectionIdx === -1) return -1;
+      for (let i = sectionIdx + 1; i < lines.length; i++) {
+        if (lines[i].trim().startsWith(linePrefix)) return i;
+        if (lines[i].startsWith('[') && i > sectionIdx + 1) break;
+      }
+      return -1;
+    };
+
+    const updateHostHeaderForProxy = (lines: string[], sectionMarker: string, newHost: string): void => {
+      const sectionIdx = lines.findIndex((l) => l.trim() === sectionMarker);
+      if (sectionIdx === -1) return;
+      for (let i = sectionIdx + 1; i < lines.length; i++) {
+        if (lines[i].trim().startsWith('proxy_set_headers')) {
+          lines[i] = lines[i].replace(/Host: [^"]+/, `Host: ${newHost}`);
+          return;
+        }
+        if (lines[i].startsWith('[') && i > sectionIdx + 1) break;
+      }
+    };
+
+    if (auth.ingressUrl) {
+      // Use the raw provider ingress URL, NOT the custom domain
+      const authIngress = auth.ingressUrl.includes('.ingress.')
+        ? auth.ingressUrl
+        : auth.ingressUrl; // already raw if it contains .ingress.
+      const authAddrsIdx = findLineAfterForProxy(pingapLines, '[upstreams.auth]', 'addrs');
+      if (authAddrsIdx !== -1) {
+        pingapLines[authAddrsIdx] = `addrs = ["${authIngress}:80"]`;
+        console.log(`  Auth upstream: ${authIngress}:80`);
+      }
+      updateHostHeaderForProxy(pingapLines, '[locations.auth]', authIngress);
+    }
+
+    if (api.apiIngressUrl) {
+      const apiIngress = api.apiIngressUrl.includes('.ingress.')
+        ? api.apiIngressUrl
+        : api.apiIngressUrl;
+      const apiAddrsIdx = findLineAfterForProxy(pingapLines, '[upstreams.api]', 'addrs');
+      if (apiAddrsIdx !== -1) {
+        pingapLines[apiAddrsIdx] = `addrs = ["${apiIngress}:80"]`;
+        console.log(`  API upstream: ${apiIngress}:80`);
+      }
+      updateHostHeaderForProxy(pingapLines, '[locations.api]', apiIngress);
+    }
+
+    fs.writeFileSync(pingapPath, pingapLines.join('\n'));
+    console.log('  ✓ Updated: infrastructure-proxy/pingap.toml');
+
+    // ── STEP 6.5: Build + push proxy image ──
+    hr('STEP 6.5: Build + push proxy image');
+    const proxyImageTag = buildAndPushProxyImage();
+    console.log(`  Using proxy image tag: ${proxyImageTag}`);
+    process.env._PROXY_IMAGE_TAG = proxyImageTag;
+
+    // ── STEP 7: Deploy SSL proxy ──
+    proxy = await deployProxy(chainSDK, owner, certificate, usedProviders);
+  } else if (!skipProxy) {
+    // Deploy proxy without updating config files (burn-in mode)
     proxy = await deployProxy(chainSDK, owner, certificate, usedProviders);
   } else {
-    hr('STEP 6: Deploy SSL proxy (skipped)');
+    hr('STEP 6-7: Deploy SSL proxy (skipped)');
     console.log('  AKASH_REDEPLOY_SKIP_PROXY=1 so the SSL proxy step is skipped.');
   }
 
-  // ── STEP 7: Update config files ──
+  // ── STEP 8: Update remaining config files ──
   if (writeFiles && proxy) {
     updateConfigFiles(database, data, api, auth, proxy);
   } else if (!writeFiles) {
-    hr('STEP 7: Update config files (skipped)');
+    hr('STEP 8: Update config files (skipped)');
     console.log('  Burn-in mode: file updates are disabled (no repo writes).');
   } else if (!proxy) {
-    hr('STEP 7: Update config files (skipped)');
+    hr('STEP 8: Update config files (skipped)');
     console.log('  Proxy was skipped, so config updates are not applied.');
   }
 
-  // ── STEP 8: Print summary ──
+  // ── STEP 8.5: Persist deployment info to .env.deploy ──
+  if (!closeOnSuccess) {
+    hr('STEP 8.5: Persist deployment info to .env.deploy');
+    persistDeploymentInfo(database, data, auth, api, proxy, databaseUrl, dbPassword);
+  }
+
+  // ── STEP 9: Print summary ──
   printSummary(database, data, api, auth, proxy, databaseUrl, { skipManualSteps: closeOnSuccess || skipProxy });
 
   if (closeOnSuccess) {

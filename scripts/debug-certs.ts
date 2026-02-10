@@ -84,7 +84,8 @@ async function main() {
   if (fs.existsSync(certPath)) {
     const localCert = JSON.parse(fs.readFileSync(certPath, 'utf8'));
     console.log('Local certificate exists at:', certPath);
-    console.log('Certificate PEM preview:', localCert.cert.substring(0, 100) + '...');
+    // Never print certificate material into logs.
+    console.log('Certificate loaded (redacted). Length:', String(localCert.cert || '').length);
   } else {
     console.log('No local certificate found at:', certPath);
   }

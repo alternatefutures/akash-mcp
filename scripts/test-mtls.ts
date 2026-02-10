@@ -27,8 +27,8 @@ async function main() {
   const certData = JSON.parse(fs.readFileSync(certPath, 'utf8'));
 
   console.log('Using certificate from:', certPath);
-  console.log('Cert starts with:', certData.cert.substring(0, 50));
-  console.log('Key starts with:', certData.privateKey.substring(0, 50));
+  // Never print certificate/private key material into logs.
+  console.log('Cert/key loaded (redacted).');
   console.log();
 
   // Create HTTPS agent with client cert

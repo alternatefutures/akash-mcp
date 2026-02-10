@@ -16,7 +16,7 @@ const PROVIDER = process.env.PROXY_PROVIDER || process.env.PROVIDER || '';
 async function main() {
   if (!DSEQ || !Number.isFinite(DSEQ) || !PROVIDER) {
     throw new Error(
-      'Missing PROXY_DSEQ/DSEQ and/or PROXY_PROVIDER/PROVIDER. Set them in the environment (see repo-root `.github/DEPLOYMENTS.md`).'
+      'Missing PROXY_DSEQ/DSEQ and/or PROXY_PROVIDER/PROVIDER. Set them in the environment (see repo-root `DEPLOYMENTS.md`).'
     );
   }
   const { wallet, client, chainSDK } = await loadWalletAndClient();

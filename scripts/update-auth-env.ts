@@ -14,7 +14,7 @@
  * Required:
  *   - akash-mcp/.env       (AKASH_MNEMONIC)
  *   - akash-mcp/.env.deploy (GHCR_PAT, JWT_SECRET, DATABASE_URL, RESEND_API_KEY, STRIPE_SECRET_KEY)
- *   - AUTH_DSEQ + AUTH_PROVIDER (set via env or inline before running; see repo-root `.github/DEPLOYMENTS.md`)
+ *   - AUTH_DSEQ + AUTH_PROVIDER (set via env or inline before running; see repo-root `DEPLOYMENTS.md`)
  */
 
 import path from 'path';
@@ -60,7 +60,7 @@ async function main() {
 
   if (!AUTH_DSEQ || !Number.isFinite(AUTH_DSEQ) || !AUTH_PROVIDER) {
     throw new Error(
-      'Missing AUTH_DSEQ / AUTH_PROVIDER. Set them in the environment (see repo-root `.github/DEPLOYMENTS.md`).'
+      'Missing AUTH_DSEQ / AUTH_PROVIDER. Set them in the environment (see repo-root `DEPLOYMENTS.md`).'
     );
   }
 
@@ -75,8 +75,11 @@ async function main() {
 
   console.log(`Auth DSEQ:      ${AUTH_DSEQ}`);
   console.log(`Auth Provider:  ${AUTH_PROVIDER}`);
-  console.log(`RESEND_API_KEY: ${resendApiKey.substring(0, 10)}...`);
-  console.log(`DATABASE_URL:   ${databaseUrl.substring(0, 24)}...`);
+  // Never print secret material into logs (CI output is often retained).
+  console.log(`RESEND_API_KEY: ${resendApiKey ? '(set)' : '(missing)'}`);
+  console.log(
+    `DATABASE_URL:   ${databaseUrl.replace(/\/\/([^:]+):([^@]+)@/g, '//$1:<redacted>@')}`
+  );
   console.log();
 
   const authImage = optEnv('AUTH_IMAGE', 'ghcr.io/alternatefutures/service-auth:latest');
