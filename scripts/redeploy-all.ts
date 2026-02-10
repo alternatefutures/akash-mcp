@@ -3,6 +3,8 @@
  * Full Clean Redeploy - Close ALL Akash deployments and redeploy everything.
  *
  * Deployment order (each depends on the previous):
+ *   0.5  Build + push service Docker images (auth, cloud-api) to GHCR
+ *         Ensures Akash containers always have the latest code + Prisma client.
  *   1.   Close all active deployments
  *   2.   Deploy PostgreSQL (standalone)
  *   3.   Deploy data services (IPFS + Jaeger)
@@ -85,6 +87,7 @@ const ALWAYS_EXCLUDE = new Set([
   'akash1rr5pzy4kz2wwwtntt5vz4as0afw0ljrfmhty8q', // No named storage vol support - only created 2/8 services
   'akash1vg3gk6dynh9ys45tzjyedp0dl52s93kap75x3n', // zanthem.cloud - creates 2/8 svcs then loses lease
   'akash1tweev0k42guyv3a2jtgphmgfrl2h5y2884vh9d', // dcnorse.eu - lease not found after manifest
+  'akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z', // Rejects TLS client cert on manifest send (SSL alert 42)
   'akash1qmumr9mdnu9e8ymyr3nnf3qyjfkugj79eh6jzq', // yggdrasil-compute.com - broken DNS: provider.provider.yggdrasil-compute.com (doubled prefix)
   'akash1sjwuwre4qprcaa34f6324yz7m8nn0awvc75gp5', // quanglong.org - repeated kube: lease not found after manifest
   // leet.haus — was excluded for persistent "kube: lease not found" but that
@@ -839,8 +842,9 @@ async function deployDatabase(
     const attemptExclude = new Set<string>([...excludeProviders, ...triedProviders]);
     console.log(`\n  [postgres] Provider attempt ${attempt}/${MAX_PROVIDER_FAILOVERS}...`);
 
-    const result = await deploySDL(sdlContent, attemptExclude, 5_000_000, chainSDK, owner, certificate, 'postgres', path.join(ROOT, 'service-cloud-api/infra/postgres-standalone.yaml'));
+    let result: any;
     try {
+      result = await deploySDL(sdlContent, attemptExclude, 5_000_000, chainSDK, owner, certificate, 'postgres', path.join(ROOT, 'service-cloud-api/infra/postgres-standalone.yaml'));
       const status = await waitForServices(
         result.providerHostUri,
         result.dseq,
@@ -885,20 +889,24 @@ async function deployDatabase(
       return { ...result, dbHost, dbPort };
     } catch (e: any) {
       lastError = e;
-      console.log(
-        `  [postgres] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`
-      );
-      recordProviderResult({
-        service: 'postgres',
-        provider: result.provider,
-        outcome: 'failing',
-        reason: e?.message || String(e),
-        dseq: result.dseq,
-        bidAmount: result.bidAmount,
-        bidDenom: result.bidDenom,
-      });
-      triedProviders.add(result.provider);
-      await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'postgres');
+      if (result) {
+        console.log(
+          `  [postgres] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`
+        );
+        recordProviderResult({
+          service: 'postgres',
+          provider: result.provider,
+          outcome: 'failing',
+          reason: e?.message || String(e),
+          dseq: result.dseq,
+          bidAmount: result.bidAmount,
+          bidDenom: result.bidDenom,
+        });
+        triedProviders.add(result.provider);
+        await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'postgres');
+      } else {
+        console.log(`  [postgres] ❌ deploySDL failed (no lease created): ${e.message || e}`);
+      }
       console.log(`  [postgres] Retrying with a different provider in 10s...`);
       await sleep(10_000);
     }
@@ -927,8 +935,9 @@ async function deployData(
     const attemptExclude = new Set<string>([...excludeProviders, ...triedProviders]);
     console.log(`\n  [data] Provider attempt ${attempt}/${MAX_PROVIDER_FAILOVERS}...`);
 
-    const result = await deploySDL(sdlContent, attemptExclude, 5_000_000, chainSDK, owner, certificate, 'data', 'inline');
+    let result: any;
     try {
+      result = await deploySDL(sdlContent, attemptExclude, 5_000_000, chainSDK, owner, certificate, 'data', 'inline');
       const status = await waitForServices(
         result.providerHostUri,
         result.dseq,
@@ -998,18 +1007,22 @@ async function deployData(
       return { ...result, ipfsIngressUrl, ipfsApiHost, ipfsApiPort, otelHost, otelPort, jaegerIngressUrl };
     } catch (e: any) {
       lastError = e;
-      console.log(`  [data] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`);
-      recordProviderResult({
-        service: 'data',
-        provider: result.provider,
-        outcome: 'failing',
-        reason: e?.message || String(e),
-        dseq: result.dseq,
-        bidAmount: result.bidAmount,
-        bidDenom: result.bidDenom,
-      });
-      triedProviders.add(result.provider);
-      await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'data');
+      if (result) {
+        console.log(`  [data] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`);
+        recordProviderResult({
+          service: 'data',
+          provider: result.provider,
+          outcome: 'failing',
+          reason: e?.message || String(e),
+          dseq: result.dseq,
+          bidAmount: result.bidAmount,
+          bidDenom: result.bidDenom,
+        });
+        triedProviders.add(result.provider);
+        await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'data');
+      } else {
+        console.log(`  [data] ❌ deploySDL failed (no lease created): ${e.message || e}`);
+      }
       console.log(`  [data] Retrying with a different provider in 10s...`);
       await sleep(10_000);
     }
@@ -1037,6 +1050,16 @@ async function deployAuth(
   const openaiApiKey = optEnv('OPENAI_API_KEY');
 
   let sdlContent = mustReadFile(path.join(ROOT, 'service-auth/deploy-akash.yaml'));
+
+  // Replace :latest with unique tag to force Akash provider to pull fresh image
+  const authTag = process.env._AUTH_IMAGE_TAG;
+  if (authTag) {
+    sdlContent = sdlContent.replace(
+      /service-auth:latest/g,
+      `service-auth:${authTag}`
+    );
+    console.log(`  [auth] Using image tag: ${authTag}`);
+  }
 
   // Substitute GHCR credentials
   sdlContent = sdlContent.replace(/\$\{GHCR_PAT\}/g, ghcrPat);
@@ -1068,8 +1091,9 @@ async function deployAuth(
     const attemptExclude = new Set<string>([...excludeProviders, ...triedProviders]);
     console.log(`\n  [auth] Provider attempt ${attempt}/${MAX_PROVIDER_FAILOVERS}...`);
 
-    const result = await deploySDL(sdlContent, attemptExclude, 5_000_000, chainSDK, owner, certificate, 'auth', 'inline');
+    let result: any;
     try {
+      result = await deploySDL(sdlContent, attemptExclude, 5_000_000, chainSDK, owner, certificate, 'auth', 'inline');
       // Wait for services
       const status = await waitForServices(
         result.providerHostUri,
@@ -1115,18 +1139,22 @@ async function deployAuth(
       return { ...result, ingressUrl: finalIngressUrl };
     } catch (e: any) {
       lastError = e;
-      console.log(`  [auth] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`);
-      recordProviderResult({
-        service: 'auth',
-        provider: result.provider,
-        outcome: 'failing',
-        reason: e?.message || String(e),
-        dseq: result.dseq,
-        bidAmount: result.bidAmount,
-        bidDenom: result.bidDenom,
-      });
-      triedProviders.add(result.provider);
-      await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'auth');
+      if (result) {
+        console.log(`  [auth] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`);
+        recordProviderResult({
+          service: 'auth',
+          provider: result.provider,
+          outcome: 'failing',
+          reason: e?.message || String(e),
+          dseq: result.dseq,
+          bidAmount: result.bidAmount,
+          bidDenom: result.bidDenom,
+        });
+        triedProviders.add(result.provider);
+        await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'auth');
+      } else {
+        console.log(`  [auth] ❌ deploySDL failed (no lease created): ${e.message || e}`);
+      }
       console.log(`  [auth] Retrying with a different provider in 10s...`);
       await sleep(10_000);
     }
@@ -1171,6 +1199,17 @@ async function deployApi(
   const akashCertJsonB64 = Buffer.from(certJson).toString('base64');
 
   let sdlContent = mustReadFile(path.join(ROOT, 'service-cloud-api/deploy-api.yaml'));
+
+  // Replace :latest with unique tag to force Akash provider to pull fresh image
+  const apiTag = process.env._API_IMAGE_TAG;
+  if (apiTag) {
+    sdlContent = sdlContent.replace(
+      /service-cloud-api:latest/g,
+      `service-cloud-api:${apiTag}`
+    );
+    console.log(`  [api] Using image tag: ${apiTag}`);
+  }
+
   sdlContent = sdlContent.replace(/__DATABASE_URL__/g, databaseUrl);
   sdlContent = sdlContent.replace(/__IPFS_API_URL__/g, ipfsApiUrl);
   sdlContent = sdlContent.replace(/__OTEL_ENDPOINT__/g, otelEndpoint);
@@ -1199,8 +1238,9 @@ async function deployApi(
     const attemptExclude = new Set<string>([...excludeProviders, ...triedProviders]);
     console.log(`\n  [api] Provider attempt ${attempt}/${MAX_PROVIDER_FAILOVERS}...`);
 
-    const result = await deploySDL(sdlContent, attemptExclude, 5_000_000, chainSDK, owner, certificate, 'api', 'inline');
+    let result: any;
     try {
+      result = await deploySDL(sdlContent, attemptExclude, 5_000_000, chainSDK, owner, certificate, 'api', 'inline');
       const status = await waitForServices(
         result.providerHostUri,
         result.dseq,
@@ -1242,18 +1282,22 @@ async function deployApi(
       return { ...result, apiIngressUrl: finalApiIngressUrl };
     } catch (e: any) {
       lastError = e;
-      console.log(`  [api] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`);
-      recordProviderResult({
-        service: 'api',
-        provider: result.provider,
-        outcome: 'failing',
-        reason: e?.message || String(e),
-        dseq: result.dseq,
-        bidAmount: result.bidAmount,
-        bidDenom: result.bidDenom,
-      });
-      triedProviders.add(result.provider);
-      await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'api');
+      if (result) {
+        console.log(`  [api] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`);
+        recordProviderResult({
+          service: 'api',
+          provider: result.provider,
+          outcome: 'failing',
+          reason: e?.message || String(e),
+          dseq: result.dseq,
+          bidAmount: result.bidAmount,
+          bidDenom: result.bidDenom,
+        });
+        triedProviders.add(result.provider);
+        await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'api');
+      } else {
+        console.log(`  [api] ❌ deploySDL failed (no lease created): ${e.message || e}`);
+      }
       console.log(`  [api] Retrying with a different provider in 10s...`);
       await sleep(10_000);
     }
@@ -1303,9 +1347,10 @@ async function deployProxy(
     const attemptExclude = new Set<string>([...excludeProviders, ...triedProviders]);
     console.log(`\n  [SSL-proxy] Provider attempt ${attempt}/${MAX_PROVIDER_FAILOVERS}...`);
 
-    const result = await deploySDL(sdlContent, attemptExclude, 5_000_000, chainSDK, owner, certificate, 'SSL-proxy', 'inline');
-
+    let result: any;
     try {
+      result = await deploySDL(sdlContent, attemptExclude, 5_000_000, chainSDK, owner, certificate, 'SSL-proxy', 'inline');
+
       // Wait for services and extract IP
       console.log(`  [SSL-proxy] Waiting for IP lease assignment...`);
       let ip = '';
@@ -1365,20 +1410,24 @@ async function deployProxy(
       throw new Error('[SSL-proxy] Timed out waiting for IP lease assignment.');
     } catch (e: any) {
       lastError = e;
-      console.log(
-        `  [SSL-proxy] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`
-      );
-      recordProviderResult({
-        service: 'SSL-proxy',
-        provider: result.provider,
-        outcome: 'failing',
-        reason: e?.message || String(e),
-        dseq: result.dseq,
-        bidAmount: result.bidAmount,
-        bidDenom: result.bidDenom,
-      });
-      triedProviders.add(result.provider);
-      await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'SSL-proxy');
+      if (result) {
+        console.log(
+          `  [SSL-proxy] ❌ Failed on provider ${result.provider} (DSEQ ${result.dseq}): ${e.message || e}`
+        );
+        recordProviderResult({
+          service: 'SSL-proxy',
+          provider: result.provider,
+          outcome: 'failing',
+          reason: e?.message || String(e),
+          dseq: result.dseq,
+          bidAmount: result.bidAmount,
+          bidDenom: result.bidDenom,
+        });
+        triedProviders.add(result.provider);
+        await closeDeploymentQuiet(chainSDK, owner, result.dseq, 'SSL-proxy');
+      } else {
+        console.log(`  [SSL-proxy] ❌ deploySDL failed (no lease created): ${e.message || e}`);
+      }
       console.log(`  [SSL-proxy] Retrying with a different provider in 10s...`);
       await sleep(10_000);
     }
@@ -1699,6 +1748,60 @@ function buildAndPushProxyImage(): string {
   return tag;
 }
 
+/**
+ * Build and push the service Docker images (auth + cloud-api).
+ *
+ * This ensures the Akash-deployed containers always have the latest code,
+ * schema, and Prisma client. Without this, deploying after schema changes
+ * causes silent runtime failures (e.g. Prisma client missing new fields).
+ *
+ * Requires Docker to be running and GHCR_PAT to have write:packages scope.
+ */
+function buildAndPushServiceImages(): void {
+  hr('STEP 0.5: Build + push service Docker images');
+
+  // Use unique timestamp tags to force Akash providers to pull fresh images.
+  // Providers cache :latest and won't re-pull it even if the digest changed.
+  // This is the same strategy used for the proxy image.
+  const tag = `deploy-${Date.now()}`;
+
+  const authDir = path.join(ROOT, 'service-auth');
+  const authBase = 'ghcr.io/alternatefutures/service-auth';
+  const authImage = `${authBase}:${tag}`;
+
+  console.log(`  Building: ${authImage} (--platform linux/amd64)...`);
+  try {
+    execSync(
+      `docker buildx build --no-cache --platform linux/amd64 -t ${authImage} -t ${authBase}:latest --push .`,
+      { cwd: authDir, stdio: 'inherit', timeout: 600_000 }
+    );
+    console.log(`  ✓ Auth image built and pushed: ${authImage}`);
+  } catch (e: any) {
+    throw new Error(`Auth image build+push failed: ${e.message || e}`);
+  }
+
+  // cloud-api Dockerfile expects the monorepo root as build context
+  // (it copies from service-cloud-api/ and akash-mcp/ paths)
+  const apiBase = 'ghcr.io/alternatefutures/service-cloud-api';
+  const apiImage = `${apiBase}:${tag}`;
+
+  console.log(`\n  Building: ${apiImage} (--platform linux/amd64)...`);
+  try {
+    execSync(
+      `docker buildx build --no-cache --platform linux/amd64 -f service-cloud-api/Dockerfile -t ${apiImage} -t ${apiBase}:latest --push .`,
+      { cwd: ROOT, stdio: 'inherit', timeout: 600_000 }
+    );
+    console.log(`  ✓ Cloud API image built and pushed: ${apiImage}`);
+  } catch (e: any) {
+    throw new Error(`Cloud API image build+push failed: ${e.message || e}`);
+  }
+
+  // Store tags so deployAuth/deployApi can inject them into SDLs
+  process.env._AUTH_IMAGE_TAG = tag;
+  process.env._API_IMAGE_TAG = tag;
+  console.log(`  Image tag: ${tag}\n`);
+}
+
 // ─── Persist deployment info to .env.deploy ─────────────────────────────────
 
 function persistDeploymentInfo(
@@ -1915,8 +2018,9 @@ function printSummary(
 
   console.log(`
   ✅ AUTOMATED (already done):
+     - Service images built and pushed (auth + cloud-api → GHCR :latest)
      - Database migrations applied (prisma migrate deploy)
-     - Subscription plans seeded (FREE, STARTER, PRO, ENTERPRISE)
+     - Subscription plans seeded (MONTHLY, YEARLY)
      - Deployment info saved to .env.deploy (DATABASE_URL, DSEQs, providers)
      - pingap.toml updated with raw provider ingress URLs
      - Proxy image built and pushed (tag: ${process.env._PROXY_IMAGE_TAG || 'main'})
@@ -2073,13 +2177,14 @@ async function main() {
   }
 
   // Validate Docker is available and can push to GHCR.
-  // The proxy image MUST be built locally with the updated pingap.toml — there
-  // is no CI fallback. This eliminates deployment ambiguity entirely.
-  if (!skipProxy) {
+  // Docker is always required: service images (auth, cloud-api) are built
+  // locally to ensure Akash containers have the latest code + Prisma client.
+  // The proxy image also requires Docker when !skipProxy.
+  {
     console.log('Validating Docker availability...');
     if (!isDockerAvailable()) {
       console.error('\n✖ Docker is required but not running.');
-      console.error('  The proxy image must be built locally with the updated pingap.toml.');
+      console.error('  Service images (auth, cloud-api, proxy) are built locally.');
       console.error('  Please start Docker Desktop (or dockerd) and re-run.');
       process.exit(1);
     }
@@ -2184,6 +2289,12 @@ async function main() {
     console.log('  If deployments fail with "kube: lease not found", install provider-services:');
     console.log('  https://github.com/akash-network/provider/releases\n');
   }
+
+  // ── STEP 0.5: Build + push service images ──
+  // Must happen BEFORE deploying auth/api so Akash pulls the latest code.
+  // This prevents stale-Prisma-client bugs where the container image was
+  // built before a schema migration was added.
+  buildAndPushServiceImages();
 
   // Track providers to build exclusion lists
   const usedProviders = new Set<string>();
