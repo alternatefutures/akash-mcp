@@ -188,6 +188,17 @@ function mustDbPassword(): string {
       'Missing required env var: POSTGRES_PASSWORD (preferred) or YSQL_PASSWORD (deprecated alias) (set it in .env.deploy)'
     );
   }
+  if (val.length < 24) {
+    throw new Error(
+      `POSTGRES_PASSWORD is too short (${val.length} chars). Minimum 24 characters required for production.`
+    );
+  }
+  if (/^[0-9a-f]+$/i.test(val) && val.length <= 32) {
+    console.warn(
+      `  ⚠ POSTGRES_PASSWORD looks like a hex hash (low entropy per char).` +
+      `\n    Consider regenerating with: openssl rand -base64 32`
+    );
+  }
   return val;
 }
 
@@ -973,13 +984,24 @@ async function deployData(
             break;
           }
         }
-        // OTel collector is currently disabled; export directly to Jaeger OTLP/HTTP (4318).
-        const jaegerPorts = status.forwarded_ports['jaeger'] || [];
-        for (const fp of jaegerPorts) {
-          if (fp.port === 4318) {
+        // OTel collector: prefer its forwarded ports; fall back to Jaeger's OTLP port
+        const otelPorts = status.forwarded_ports['otel-collector'] || [];
+        for (const fp of otelPorts) {
+          if (fp.port === 4317 && fp.proto === 'TCP') {
             otelHost = fp.host;
             otelPort = fp.externalPort;
             break;
+          }
+        }
+        if (!otelHost) {
+          // Fallback: Jaeger exposes OTLP directly (for when OTel collector is disabled)
+          const jaegerPorts = status.forwarded_ports['jaeger'] || [];
+          for (const fp of jaegerPorts) {
+            if (fp.port === 4317 && fp.proto === 'TCP') {
+              otelHost = fp.host;
+              otelPort = fp.externalPort;
+              break;
+            }
           }
         }
       }
@@ -1436,32 +1458,79 @@ async function deployProxy(
   throw lastError || new Error('[SSL-proxy] Failed after provider failover attempts.');
 }
 
+// ─── Step 4.25: Create separate auth database ──────────────────────────────
+//
+// Auth and cloud-api now use SEPARATE databases on the same PostgreSQL server.
+// This eliminates the cross-contamination risk where `prisma db push` from one
+// service would drop the other's tables.
+//
+//   - auth:      postgresql://...@host:port/alternatefutures_auth
+//   - cloud-api: postgresql://...@host:port/alternatefutures  (unchanged)
+
+async function createAuthDatabase(apiDatabaseUrl: string): Promise<string> {
+  hr('STEP 4.25: Create separate auth database');
+
+  const authDir = path.join(ROOT, 'service-auth');
+  const authDbName = 'alternatefutures_auth';
+  const authDatabaseUrl = apiDatabaseUrl.replace(
+    /\/alternatefutures$/,
+    `/${authDbName}`
+  );
+
+  console.log(`  Creating database "${authDbName}" if it doesn't exist...`);
+  try {
+    // CREATE DATABASE can't use IF NOT EXISTS in PostgreSQL.
+    // Just try to create it — if it already exists we catch the error.
+    execSync(
+      `echo "CREATE DATABASE ${authDbName};" | npx prisma db execute --url "${apiDatabaseUrl}" --stdin`,
+      {
+        cwd: authDir,
+        env: { ...process.env, DATABASE_URL: apiDatabaseUrl },
+        stdio: 'pipe',
+        timeout: 30_000,
+      }
+    );
+    console.log(`  ✓ Database "${authDbName}" created.`);
+  } catch (e: any) {
+    const errMsg = e.stderr?.toString() || e.stdout?.toString() || e.message || '';
+    // "database already exists" is fine — just means a previous deploy created it
+    if (errMsg.includes('already exists')) {
+      console.log(`  ✓ Database "${authDbName}" already exists.`);
+    } else {
+      console.error(`  ✖ Failed to create auth database: ${errMsg}`);
+      console.error(`  Falling back to shared database.`);
+      return apiDatabaseUrl;
+    }
+  }
+
+  console.log(`  Auth DATABASE_URL: ${redactDatabaseUrl(authDatabaseUrl)}`);
+  return authDatabaseUrl;
+}
+
 // ─── Step 4.5: Run database migrations + seed ──────────────────────────────
 //
-// CRITICAL: Two services share the same PostgreSQL database with SEPARATE
-// Prisma schemas (service-auth and service-cloud-api). See INCIDENTS.md.
+// Auth and cloud-api use SEPARATE databases to eliminate cross-contamination.
+// See INCIDENTS.md (2026-02-10).
 //
-//   - service-auth: uses `prisma migrate deploy` (migrations are complete)
-//   - service-cloud-api: migrations are NOW COMPLETE (2026-02-09 fix: merged
-//     Organization/Service/Billing tables into the first migration). The
-//     `migrate diff` fallback below is kept for safety but should be a no-op.
-//
-//   NEVER use `prisma db push` for cloud-api — it drops all auth tables.
+//   - service-auth:      uses `prisma migrate deploy` on alternatefutures_auth
+//   - service-cloud-api: uses additive-only schema sync on alternatefutures
 
-async function runDatabaseMigrations(databaseUrl: string): Promise<void> {
+async function runDatabaseMigrations(authDatabaseUrl: string, apiDatabaseUrl: string): Promise<void> {
   hr('STEP 4.5: Run database migrations + seed');
 
   const authDir = path.join(ROOT, 'service-auth');
   const apiDir = path.join(ROOT, 'service-cloud-api');
-  const env = { ...process.env, DATABASE_URL: databaseUrl };
+  const authEnv = { ...process.env, DATABASE_URL: authDatabaseUrl };
+  const apiEnv = { ...process.env, DATABASE_URL: apiDatabaseUrl };
 
   // ── 1. service-auth: prisma migrate deploy ──
   // Safe: only applies pending migration files, never drops tables.
+  // Now targets the dedicated auth database (alternatefutures_auth).
   console.log('  [auth] Running prisma migrate deploy...');
   try {
     const migrateOutput = execSync('npx prisma migrate deploy', {
       cwd: authDir,
-      env,
+      env: authEnv,
       stdio: 'pipe',
       timeout: 120_000,
     }).toString();
@@ -1469,15 +1538,14 @@ async function runDatabaseMigrations(databaseUrl: string): Promise<void> {
   } catch (e: any) {
     const stderr = e.stderr?.toString() || '';
     const stdout = e.stdout?.toString() || '';
-    // db push is ONLY safe for auth because it's the first service to touch
-    // the DB on a clean deploy. Once cloud-api tables exist this would be
-    // destructive, but on a clean deploy the DB is empty at this point.
+    // db push is safe for auth now — it has its own dedicated database
+    // and cannot affect cloud-api tables.
     console.log(`  [auth] prisma migrate deploy failed: ${stderr || stdout}`);
-    console.log('  [auth] Trying prisma db push (safe for initial schema creation)...');
+    console.log('  [auth] Trying prisma db push (safe — auth has its own database)...');
     try {
       const pushOutput = execSync('npx prisma db push', {
         cwd: authDir,
-        env,
+        env: authEnv,
         stdio: 'pipe',
         timeout: 120_000,
       }).toString();
@@ -1493,7 +1561,7 @@ async function runDatabaseMigrations(databaseUrl: string): Promise<void> {
   try {
     const seedOutput = execSync('npx tsx scripts/seed-plans.ts', {
       cwd: authDir,
-      env,
+      env: authEnv,
       stdio: 'pipe',
       timeout: 60_000,
     }).toString();
@@ -1504,19 +1572,17 @@ async function runDatabaseMigrations(databaseUrl: string): Promise<void> {
   }
 
   // ── 3. service-cloud-api: additive-only schema sync ──
-  // Cloud-api migrations are now complete (2026-02-09 fix), so this diff
-  // should normally be a no-op. Kept as a safety net to catch any future
-  // schema drift without destructive DROPs.
-  //
-  // NEVER use `prisma db push` here — it would drop all auth_* tables.
-  console.log('\n  [cloud-api] Syncing schema (additive-only, no DROPs)...');
+  // Cloud-api now has its own database (alternatefutures), separate from auth.
+  // `prisma db push` is SAFE here since it can no longer affect auth tables.
+  // However, we keep the additive-only approach for safety.
+  console.log('\n  [cloud-api] Syncing schema (additive-only)...');
   try {
     // Generate diff: current DB state → target schema
     const diffSql = execSync(
-      `npx prisma migrate diff --from-url "${databaseUrl}" --to-schema-datamodel prisma/schema.prisma --script`,
+      `npx prisma migrate diff --from-url "${apiDatabaseUrl}" --to-schema-datamodel prisma/schema.prisma --script`,
       {
         cwd: apiDir,
-        env,
+        env: apiEnv,
         stdio: 'pipe',
         timeout: 120_000,
       }
@@ -1575,10 +1641,10 @@ async function runDatabaseMigrations(databaseUrl: string): Promise<void> {
           console.log(`  [cloud-api] Applying ${stmtCount} additive statement(s)...`);
 
           execSync(
-            `npx prisma db execute --url "${databaseUrl}" --stdin < "${tmpSql}"`,
+            `npx prisma db execute --url "${apiDatabaseUrl}" --stdin < "${tmpSql}"`,
             {
               cwd: apiDir,
-              env,
+              env: apiEnv,
               stdio: 'pipe',
               timeout: 120_000,
             }
@@ -1603,7 +1669,7 @@ async function runDatabaseMigrations(databaseUrl: string): Promise<void> {
           try {
             execSync(
               `npx prisma migrate resolve --applied ${migration}`,
-              { cwd: apiDir, env, stdio: 'pipe', timeout: 30_000 }
+              { cwd: apiDir, env: apiEnv, stdio: 'pipe', timeout: 30_000 }
             );
           } catch {
             // Already applied or doesn't exist in _prisma_migrations — fine
@@ -1625,8 +1691,8 @@ async function runDatabaseMigrations(databaseUrl: string): Promise<void> {
     console.error('  [cloud-api] Fix manually: see INCIDENTS.md (Shared Postgres + Prisma policy)');
   }
 
-  // ── 4. Verify critical tables from BOTH services exist ──
-  console.log('\n  Verifying critical database tables...');
+  // ── 4. Verify critical tables from BOTH services (separate databases) ──
+  console.log('\n  Verifying critical database tables (separate databases)...');
   try {
     const verifyOutput = execSync(
       `npx tsx -e "
@@ -1642,7 +1708,7 @@ async function runDatabaseMigrations(databaseUrl: string): Promise<void> {
       "`,
       {
         cwd: authDir,
-        env,
+        env: authEnv,
         stdio: 'pipe',
         timeout: 30_000,
       }
@@ -1671,7 +1737,7 @@ async function runDatabaseMigrations(databaseUrl: string): Promise<void> {
       "`,
       {
         cwd: apiDir,
-        env,
+        env: apiEnv,
         stdio: 'pipe',
         timeout: 30_000,
       }
@@ -1810,7 +1876,8 @@ function persistDeploymentInfo(
   auth: AuthResult,
   api: ApiResult,
   proxy: ProxyResult | null,
-  databaseUrl: string,
+  authDatabaseUrl: string,
+  apiDatabaseUrl: string,
   dbPassword: string
 ): void {
   const envDeployPath = path.resolve(__dirname, '../.env.deploy');
@@ -1831,10 +1898,12 @@ function persistDeploymentInfo(
     }
   }
 
-  // Database
+  // Databases (separate: auth vs cloud-api)
   setEnvVar('POSTGRES_PASSWORD', dbPassword);
   setEnvVar('YSQL_PASSWORD', dbPassword);
-  setEnvVar('DATABASE_URL', databaseUrl);
+  setEnvVar('AUTH_DATABASE_URL', authDatabaseUrl);
+  setEnvVar('API_DATABASE_URL', apiDatabaseUrl);
+  setEnvVar('DATABASE_URL', apiDatabaseUrl); // backward-compat: default to api
 
   // Deployment identifiers
   setEnvVar('AUTH_DSEQ', String(auth.dseq));
@@ -1909,7 +1978,7 @@ function updateConfigFiles(
 | Service | DSEQ | Provider | Deployed | Notes |
 |---------|------|----------|----------|-------|
 | postgres (db) | ${database.dseq} | \`${database.provider}\` | ${now} | PostgreSQL 16 Alpine, persistent storage |
-| data services | ${data.dseq} | \`${data.provider}\` | ${now} | IPFS + Jaeger (OTel collector disabled) |
+| data services | ${data.dseq} | \`${data.provider}\` | ${now} | IPFS + Jaeger + OTel Collector |
 | api | ${api.dseq} | \`${api.provider}\` | ${now} | GraphQL API |
 | service-auth | ${auth.dseq} | \`${auth.provider}\` | ${now} | Standalone auth service |
 | infrastructure-proxy (SSL) | ${proxy.dseq} | \`${proxy.provider}\` | ${now} | Pingap SSL proxy, dedicated IP ${proxy.ip || 'TBD'} |
@@ -1927,8 +1996,10 @@ PostgreSQL is exposed globally via TCP:
 - **Host**: ${database.dbHost}
 - **Port**: ${database.dbPort}
 - **User**: alternatefutures
-- **Database**: alternatefutures
-- **Connection string**: \`postgresql://alternatefutures:<password>@${database.dbHost}:${database.dbPort}/alternatefutures\`
+- **Auth database**: \`alternatefutures_auth\` (used by service-auth)
+- **API database**: \`alternatefutures\` (used by service-cloud-api)
+- **Auth connection**: \`postgresql://alternatefutures:<password>@${database.dbHost}:${database.dbPort}/alternatefutures_auth\`
+- **API connection**: \`postgresql://alternatefutures:<password>@${database.dbHost}:${database.dbPort}/alternatefutures\`
 
 ## Secrets Management
 
@@ -1979,7 +2050,8 @@ function printSummary(
   api: ApiResult,
   auth: AuthResult,
   proxy: ProxyResult | null,
-  databaseUrl: string,
+  authDatabaseUrl: string,
+  apiDatabaseUrl: string,
   opts?: { skipManualSteps?: boolean }
 ) {
   hr('DEPLOYMENT COMPLETE - SUMMARY');
@@ -1989,6 +2061,8 @@ function printSummary(
     DSEQ:       ${database.dseq}
     Provider:   ${database.provider}
     PostgreSQL: ${database.dbHost}:${database.dbPort}
+    Auth DB:    alternatefutures_auth
+    API DB:     alternatefutures
 
   data services
     DSEQ:       ${data.dseq}
@@ -2014,7 +2088,8 @@ function printSummary(
 
   hr('POST-DEPLOY CHECKLIST');
 
-  const databaseUrlRedacted = redactDatabaseUrl(databaseUrl);
+  const authDatabaseUrlRedacted = redactDatabaseUrl(authDatabaseUrl);
+  const apiDatabaseUrlRedacted = redactDatabaseUrl(apiDatabaseUrl);
 
   console.log(`
   ✅ AUTOMATED (already done):
@@ -2028,8 +2103,10 @@ function printSummary(
   REMAINING MANUAL STEPS:
 
   1. UPDATE GITHUB SECRETS (if you use CI/CD):
-     Set DATABASE_URL to:
-     ${databaseUrlRedacted}
+     Set AUTH_DATABASE_URL to:
+     ${authDatabaseUrlRedacted}
+     Set API_DATABASE_URL (or DATABASE_URL) to:
+     ${apiDatabaseUrlRedacted}
 
   2. UPDATE CLOUDFLARE DNS (if proxy IP changed):
      A records for *.alternatefutures.ai -> ${proxy?.ip || 'TBD'}
@@ -2313,10 +2390,14 @@ async function main() {
   const data = await deployData(chainSDK, owner, certificate, new Set([database.provider]));
   usedProviders.add(data.provider);
 
-  // Construct DATABASE_URL
+  // Construct DATABASE_URLs (separate databases for auth and cloud-api)
   const dbPassword = mustDbPassword();
-  const databaseUrl = `postgresql://alternatefutures:${dbPassword}@${database.dbHost}:${database.dbPort}/alternatefutures`;
-  console.log(`\n  DATABASE_URL: ${redactDatabaseUrl(databaseUrl)}`);
+  const apiDatabaseUrl = `postgresql://alternatefutures:${dbPassword}@${database.dbHost}:${database.dbPort}/alternatefutures`;
+  console.log(`\n  API DATABASE_URL: ${redactDatabaseUrl(apiDatabaseUrl)}`);
+
+  // ── STEP 4.25: Create separate auth database ──
+  const authDatabaseUrl = await createAuthDatabase(apiDatabaseUrl);
+  console.log(`  AUTH DATABASE_URL: ${redactDatabaseUrl(authDatabaseUrl)}`);
 
   // Construct IPFS API URL + OTel endpoint
   const ipfsApiUrl = `http://${data.ipfsApiHost}:${data.ipfsApiPort}`;
@@ -2330,15 +2411,14 @@ async function main() {
     owner,
     certificate,
     new Set([database.provider, data.provider]),
-    databaseUrl
+    authDatabaseUrl
   );
   usedProviders.add(auth.provider);
 
   // ── STEP 4.5: Run database migrations + seed ──
   // Must happen AFTER postgres is running and BEFORE API deploy (so API can
-  // also assume tables exist). This is the critical step that was missing
-  // from the original script — without it, auth returns 500 on any DB operation.
-  await runDatabaseMigrations(databaseUrl);
+  // also assume tables exist). Auth and cloud-api use SEPARATE databases.
+  await runDatabaseMigrations(authDatabaseUrl, apiDatabaseUrl);
 
   // ── STEP 5: Deploy API ──
   const api = await deployApi(
@@ -2346,7 +2426,7 @@ async function main() {
     owner,
     certificate,
     new Set([database.provider, data.provider, auth.provider]),
-    databaseUrl,
+    apiDatabaseUrl,
     ipfsApiUrl,
     otelEndpoint
   );
@@ -2447,11 +2527,11 @@ async function main() {
   // ── STEP 8.5: Persist deployment info to .env.deploy ──
   if (!closeOnSuccess) {
     hr('STEP 8.5: Persist deployment info to .env.deploy');
-    persistDeploymentInfo(database, data, auth, api, proxy, databaseUrl, dbPassword);
+    persistDeploymentInfo(database, data, auth, api, proxy, authDatabaseUrl, apiDatabaseUrl, dbPassword);
   }
 
   // ── STEP 9: Print summary ──
-  printSummary(database, data, api, auth, proxy, databaseUrl, { skipManualSteps: closeOnSuccess || skipProxy });
+  printSummary(database, data, api, auth, proxy, authDatabaseUrl, apiDatabaseUrl, { skipManualSteps: closeOnSuccess || skipProxy });
 
   if (closeOnSuccess) {
     hr('BURN-IN MODE: Closing deployments');
