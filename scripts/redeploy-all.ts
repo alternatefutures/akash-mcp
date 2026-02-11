@@ -6,8 +6,8 @@
  *   0.5  Build + push service Docker images (auth, cloud-api) to GHCR
  *         Ensures Akash containers always have the latest code + Prisma client.
  *   1.   Close all active deployments
- *   2.   Deploy PostgreSQL (standalone)
- *   3.   Deploy data services (IPFS + Jaeger)
+ *   2.   Deploy data services (IPFS + Jaeger) — most constrained, deploys first
+ *   3.   Deploy PostgreSQL (standalone)
  *   4.   Deploy auth (standalone, with DATABASE_URL + secrets injected via env vars)
  *   4.5  Run database migrations for BOTH services + seed subscription plans
  *         - service-auth: prisma migrate deploy (migrations are complete)
@@ -832,7 +832,7 @@ async function closeAllDeployments(chainSDK: any, owner: string) {
   await sleep(10_000);
 }
 
-// ─── Step 2: Deploy PostgreSQL ───────────────────────────────────────────────
+// ─── Step 3: Deploy PostgreSQL ───────────────────────────────────────────────
 
 async function deployDatabase(
   chainSDK: any,
@@ -840,7 +840,7 @@ async function deployDatabase(
   certificate: any,
   excludeProviders: Set<string>
 ): Promise<DatabaseResult> {
-  hr('STEP 2: Deploy PostgreSQL (standalone)');
+  hr('STEP 3: Deploy PostgreSQL (standalone)');
 
   const dbPassword = mustDbPassword();
   let sdlContent = mustReadFile(path.join(ROOT, 'service-cloud-api/infra/postgres-standalone.yaml'));
@@ -926,7 +926,7 @@ async function deployDatabase(
   throw lastError || new Error('[postgres] Failed after provider failover attempts.');
 }
 
-// ─── Step 3: Deploy data services ────────────────────────────────────────────
+// ─── Step 2: Deploy data services ────────────────────────────────────────────
 
 async function deployData(
   chainSDK: any,
@@ -934,10 +934,10 @@ async function deployData(
   certificate: any,
   excludeProviders: Set<string>
 ): Promise<DataResult> {
-  hr('STEP 3: Deploy data services (IPFS + Jaeger)');
+  hr('STEP 2: Deploy data services (IPFS + Jaeger)');
 
-  let sdlContent = mustReadFile(path.join(ROOT, 'service-cloud-api/deploy-data.yaml'));
-  sdlContent = injectGhcrCredentials(sdlContent);
+  const sdlContent = mustReadFile(path.join(ROOT, 'service-cloud-api/deploy-data.yaml'));
+  // No GHCR credential injection needed — data services use only public images
 
   const triedProviders = new Set<string>();
   let lastError: any = null;
@@ -984,24 +984,13 @@ async function deployData(
             break;
           }
         }
-        // OTel collector: prefer its forwarded ports; fall back to Jaeger's OTLP port
-        const otelPorts = status.forwarded_ports['otel-collector'] || [];
-        for (const fp of otelPorts) {
+        // OTel endpoint: Jaeger natively exposes OTLP gRPC on port 4317
+        const jaegerPorts = status.forwarded_ports['jaeger'] || [];
+        for (const fp of jaegerPorts) {
           if (fp.port === 4317 && fp.proto === 'TCP') {
             otelHost = fp.host;
             otelPort = fp.externalPort;
             break;
-          }
-        }
-        if (!otelHost) {
-          // Fallback: Jaeger exposes OTLP directly (for when OTel collector is disabled)
-          const jaegerPorts = status.forwarded_ports['jaeger'] || [];
-          for (const fp of jaegerPorts) {
-            if (fp.port === 4317 && fp.proto === 'TCP') {
-              otelHost = fp.host;
-              otelPort = fp.externalPort;
-              break;
-            }
           }
         }
       }
@@ -1010,7 +999,7 @@ async function deployData(
       console.log(`    IPFS ingress:   ${ipfsIngressUrl || '(not found)'}`);
       console.log(`    IPFS API:       ${ipfsApiHost}:${ipfsApiPort} ${ipfsApiPort ? '' : '(not found)'}`);
       console.log(`    Jaeger ingress: ${jaegerIngressUrl || '(not found)'}`);
-      console.log(`    OTel endpoint:  ${otelHost}:${otelPort} ${otelPort ? '' : '(not found)'}`);
+      console.log(`    Jaeger OTLP:    ${otelHost}:${otelPort} ${otelPort ? '' : '(not found)'}`);
 
       if (!ipfsApiHost || !ipfsApiPort) {
         console.log('\n  Full lease status for debugging:');
@@ -1274,6 +1263,8 @@ async function deployApi(
 
       let apiIngressUrl = '';
       let rawApiIngressUrl = '';
+      let apiTcpHost = '';
+      let apiTcpPort = 0;
       if (status?.services) {
         for (const [, info] of Object.entries(status.services) as any) {
           const uris = info?.uris || [];
@@ -1283,14 +1274,27 @@ async function deployApi(
           }
         }
       }
+      // Extract TCP forwarded port (bypasses provider nginx — avoids HTTP→HTTPS redirect)
+      if (status?.forwarded_ports?.api) {
+        for (const fp of status.forwarded_ports.api) {
+          if (fp.port === 4000 && fp.proto === 'TCP') {
+            apiTcpHost = fp.host;
+            apiTcpPort = fp.externalPort;
+            break;
+          }
+        }
+      }
 
       const finalApiIngressUrl = rawApiIngressUrl || apiIngressUrl;
       console.log(`  API ingress: ${finalApiIngressUrl || '(not found)'}`);
+      if (apiTcpHost && apiTcpPort) {
+        console.log(`  API TCP forwarded port: ${apiTcpHost}:${apiTcpPort} (preferred for proxy)`);
+      }
       if (rawApiIngressUrl && rawApiIngressUrl !== apiIngressUrl) {
         console.log(`  API custom domain: ${apiIngressUrl} (not used for proxy)`);
       }
-      if (!finalApiIngressUrl) {
-        throw new Error('[api] Could not detect ingress URL from lease status.');
+      if (!finalApiIngressUrl && !apiTcpHost) {
+        throw new Error('[api] Could not detect ingress URL or TCP port from lease status.');
       }
 
       recordProviderResult({
@@ -1301,7 +1305,7 @@ async function deployApi(
         bidAmount: result.bidAmount,
         bidDenom: result.bidDenom,
       });
-      return { ...result, apiIngressUrl: finalApiIngressUrl };
+      return { ...result, apiIngressUrl: finalApiIngressUrl, apiTcpHost, apiTcpPort };
     } catch (e: any) {
       lastError = e;
       if (result) {
@@ -1978,7 +1982,7 @@ function updateConfigFiles(
 | Service | DSEQ | Provider | Deployed | Notes |
 |---------|------|----------|----------|-------|
 | postgres (db) | ${database.dseq} | \`${database.provider}\` | ${now} | PostgreSQL 16 Alpine, persistent storage |
-| data services | ${data.dseq} | \`${data.provider}\` | ${now} | IPFS + Jaeger + OTel Collector |
+| data services | ${data.dseq} | \`${data.provider}\` | ${now} | IPFS + Jaeger |
 | api | ${api.dseq} | \`${api.provider}\` | ${now} | GraphQL API |
 | service-auth | ${auth.dseq} | \`${auth.provider}\` | ${now} | Standalone auth service |
 | infrastructure-proxy (SSL) | ${proxy.dseq} | \`${proxy.provider}\` | ${now} | Pingap SSL proxy, dedicated IP ${proxy.ip || 'TBD'} |
@@ -2068,7 +2072,7 @@ function printSummary(
     DSEQ:       ${data.dseq}
     Provider:   ${data.provider}
     IPFS:       ${data.ipfsIngressUrl || '(check Akash Console)'}
-    OTel:       ${data.otelHost}:${data.otelPort}
+    Jaeger OTLP: ${data.otelHost}:${data.otelPort}
 
   api
     DSEQ:     ${api.dseq}
@@ -2382,13 +2386,15 @@ async function main() {
   // ── STEP 1: Close all ──
   await closeAllDeployments(chainSDK, owner);
 
-  // ── STEP 2: Deploy PostgreSQL ──
-  const database = await deployDatabase(chainSDK, owner, certificate, new Set());
-  usedProviders.add(database.provider);
-
-  // ── STEP 3: Deploy data services ──
-  const data = await deployData(chainSDK, owner, certificate, new Set([database.provider]));
+  // ── STEP 2: Deploy data services (FIRST — most constrained by provider pool) ──
+  // Data services require persistent storage + multi-service, so they get first
+  // pick of providers before simpler deployments consume the limited pool.
+  const data = await deployData(chainSDK, owner, certificate, new Set());
   usedProviders.add(data.provider);
+
+  // ── STEP 3: Deploy PostgreSQL ──
+  const database = await deployDatabase(chainSDK, owner, certificate, new Set([data.provider]));
+  usedProviders.add(database.provider);
 
   // Construct DATABASE_URLs (separate databases for auth and cloud-api)
   const dbPassword = mustDbPassword();
@@ -2410,7 +2416,7 @@ async function main() {
     chainSDK,
     owner,
     certificate,
-    new Set([database.provider, data.provider]),
+    new Set([data.provider, database.provider]),
     authDatabaseUrl
   );
   usedProviders.add(auth.provider);
@@ -2425,7 +2431,7 @@ async function main() {
     chainSDK,
     owner,
     certificate,
-    new Set([database.provider, data.provider, auth.provider]),
+    new Set([data.provider, database.provider, auth.provider]),
     apiDatabaseUrl,
     ipfsApiUrl,
     otelEndpoint
@@ -2482,14 +2488,23 @@ async function main() {
       updateHostHeaderForProxy(pingapLines, '[locations.auth]', authIngress);
     }
 
-    if (api.apiIngressUrl) {
-      const apiIngress = api.apiIngressUrl.includes('.ingress.')
-        ? api.apiIngressUrl
-        : api.apiIngressUrl;
+    if (api.apiTcpHost && api.apiTcpPort) {
+      // Prefer TCP forwarded port — bypasses provider nginx entirely,
+      // avoiding HTTP→HTTPS redirect issues on some providers (e.g. leet.haus).
+      const apiUpstream = `${api.apiTcpHost}:${api.apiTcpPort}`;
+      const apiAddrsIdx = findLineAfterForProxy(pingapLines, '[upstreams.api]', 'addrs');
+      if (apiAddrsIdx !== -1) {
+        pingapLines[apiAddrsIdx] = `addrs = ["${apiUpstream}"]`;
+        console.log(`  API upstream (TCP): ${apiUpstream}`);
+      }
+      updateHostHeaderForProxy(pingapLines, '[locations.api]', 'api.alternatefutures.ai');
+    } else if (api.apiIngressUrl) {
+      // Fallback to HTTP ingress (works on providers that don't redirect HTTP→HTTPS)
+      const apiIngress = api.apiIngressUrl;
       const apiAddrsIdx = findLineAfterForProxy(pingapLines, '[upstreams.api]', 'addrs');
       if (apiAddrsIdx !== -1) {
         pingapLines[apiAddrsIdx] = `addrs = ["${apiIngress}:80"]`;
-        console.log(`  API upstream: ${apiIngress}:80`);
+        console.log(`  API upstream (HTTP): ${apiIngress}:80`);
       }
       updateHostHeaderForProxy(pingapLines, '[locations.api]', apiIngress);
     }
@@ -2504,10 +2519,13 @@ async function main() {
     process.env._PROXY_IMAGE_TAG = proxyImageTag;
 
     // ── STEP 7: Deploy SSL proxy ──
-    proxy = await deployProxy(chainSDK, owner, certificate, usedProviders);
+    // SSL proxy uses a dedicated IP lease and doesn't conflict with other
+    // services on the same provider. Don't exclude used providers — the IP
+    // lease pool is too small to afford aggressive exclusions.
+    proxy = await deployProxy(chainSDK, owner, certificate, new Set());
   } else if (!skipProxy) {
     // Deploy proxy without updating config files (burn-in mode)
-    proxy = await deployProxy(chainSDK, owner, certificate, usedProviders);
+    proxy = await deployProxy(chainSDK, owner, certificate, new Set());
   } else {
     hr('STEP 6-7: Deploy SSL proxy (skipped)');
     console.log('  AKASH_REDEPLOY_SKIP_PROXY=1 so the SSL proxy step is skipped.');
