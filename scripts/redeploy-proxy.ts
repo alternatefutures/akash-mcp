@@ -12,10 +12,11 @@ import { loadWalletAndClient } from '../src/utils/load-wallet.js';
 import { loadCertificate } from '../src/utils/load-certificate.js';
 import { sendManifest } from '../src/tools/send-manifest.js';
 
-const ROOT = path.resolve('/Users/og/Documents/Projects/AlternateFutures');
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, '../..');
 
-config({ path: path.resolve('.env') });
-config({ path: path.resolve('.env.deploy') });
+config({ path: path.resolve(__dirname, '../.env') });
+config({ path: path.resolve(__dirname, '../.env.deploy') });
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -24,14 +25,14 @@ function toPipedPem(pem: string): string {
 }
 
 async function main() {
-  const { wallet, chainSDK } = await loadWalletAndClient();
+  const { wallet, client, chainSDK } = await loadWalletAndClient();
   const accounts = await wallet.getAccounts();
   const owner = accounts[0].address;
-  const certificate = await loadCertificate(wallet);
+  const certificate = await loadCertificate(wallet, client, chainSDK);
   console.log(`Owner: ${owner}`);
 
   // Close orphaned deployments from previous attempts
-  for (const oldDseq of [25474494, 25474615, 25474627, 25474654]) {
+  for (const oldDseq of [25474494, 25474615, 25474627, 25474654, 25481537, 25481549]) {
     console.log(`Closing DSEQ ${oldDseq}...`);
     try {
       await chainSDK.akash.deployment.v1beta4.closeDeployment({
@@ -49,7 +50,7 @@ async function main() {
   let sdlContent = fs.readFileSync(path.join(ROOT, 'infrastructure-proxy/deploy-akash-ip-lease.yaml'), 'utf8');
 
   // Inject image tag
-  const IMAGE_TAG = 'deploy-1770773298';
+  const IMAGE_TAG = 'main';
   sdlContent = sdlContent.replace(
     /image:\s+ghcr\.io\/alternatefutures\/infrastructure-proxy-pingap:[^\s]+/,
     `image: ghcr.io/alternatefutures/infrastructure-proxy-pingap:${IMAGE_TAG}`
@@ -109,9 +110,7 @@ async function main() {
   console.log(`Received ${bids.length} bid(s).`);
 
   const EXCLUDE = new Set([
-    'akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z',
-    'akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk',
-    'akash15tl6v6gd0nte0syyxnv57zmmspgju4c3xfmdhk',
+    'akash15tl6v6gd0nte0syyxnv57zmmspgju4c3xfmdhk',  // hurricane - SSL bad cert when sending manifest
   ]);
 
   const usable = bids.filter((b: any) => {

@@ -25,7 +25,7 @@ config({ path: path.resolve(__dirname, '../.env') });
 config({ path: path.resolve(__dirname, '../.env.deploy') });
 
 // ─── Current deployment info ────────────────────────────────────────────────
-const OLD_DSEQ = 25423196;
+const OLD_DSEQ = 25474472;
 
 // ─── Providers to exclude ───────────────────────────────────────────────────
 const EXCLUDE_PROVIDERS = new Set([
@@ -89,12 +89,24 @@ async function main() {
 
   const ghcrPat = mustEnv('GHCR_PAT');
   const jwtSecret = mustEnv('JWT_SECRET');
-  const ysqlPassword = mustEnv('YSQL_PASSWORD');
+  const databaseUrl = mustEnv('DATABASE_URL');
   const resendApiKey = optEnv('RESEND_API_KEY');
+  const ipfsApiUrl = mustEnv('IPFS_API_URL');
+  const otelEndpoint = optEnv('OTEL_EXPORTER_OTLP_ENDPOINT', '');
+  const akashMnemonic = optEnv('AKASH_MNEMONIC');
+  const rpcEndpoint = optEnv('RPC_ENDPOINT', 'https://rpc.akashnet.net:443');
+  const grpcEndpoint = optEnv('GRPC_ENDPOINT', 'https://akash-grpc.publicnode.com:443');
 
-  const databaseUrl = `postgresql://alternatefutures:${ysqlPassword}@provider.europlots.com:32648/alternatefutures`;
-  const ipfsApiUrl = 'http://provider.boogle.cloud:32479';
-  const otelEndpoint = 'http://provider.boogle.cloud:31007';
+  // Load Akash cert for MCP (same as update-cloud-api-image.ts)
+  let akashCertJson = '';
+  const certPath = path.resolve(__dirname, '../.local/akash-certs');
+  const certFiles = fs.existsSync(certPath)
+    ? fs.readdirSync(certPath).filter((f: string) => f.endsWith('.json'))
+    : [];
+  if (certFiles.length > 0) {
+    const certContent = fs.readFileSync(path.join(certPath, certFiles[0]), 'utf-8');
+    akashCertJson = Buffer.from(certContent).toString('base64');
+  }
 
   // ─── Generate SDL ──────────────────────────────────────────────────────────
   const sdlContent = `---
@@ -114,6 +126,11 @@ services:
       - JWT_SECRET=${jwtSecret}
       - AUTH_SERVICE_URL=https://auth.alternatefutures.ai
       - RESEND_API_KEY=${resendApiKey}
+      - AKASH_MNEMONIC=${akashMnemonic}
+      - RPC_ENDPOINT=${rpcEndpoint}
+      - GRPC_ENDPOINT=${grpcEndpoint}
+      - AKASH_MCP_PATH=/app/akash-mcp/dist/index.js
+      - AKASH_CERT_JSON=${akashCertJson}
       - IPFS_API_URL=${ipfsApiUrl}
       - IPFS_GATEWAY_URL=https://ipfs.alternatefutures.ai
       - ARWEAVE_WALLET=
