@@ -1,8 +1,8 @@
 /**
- * Quick script to update the API deployment on Akash.
+ * Create a new API deployment on Akash.
  * Uses akash-mcp internals (JS SDK, no CLI binary needed).
  *
- * Usage: npx tsx scripts/redeploy-api.ts
+ * Usage: npx tsx scripts/deploy-api.ts
  */
 
 import dotenv from 'dotenv'
@@ -17,15 +17,8 @@ dotenv.config({ path: resolve(mcpRoot, '.env.deploy') })
 
 const { loadWalletAndClient } = await import('../src/utils/load-wallet.js')
 const { loadCertificate } = await import('../src/utils/load-certificate.js')
-const { UpdateDeploymentTool } = await import('../src/tools/update-deployment.js')
-
-const API_DSEQ = Number(process.env.API_DSEQ)
-const API_PROVIDER = process.env.API_PROVIDER!
-
-if (!API_DSEQ || !API_PROVIDER) {
-  console.error('API_DSEQ and API_PROVIDER must be set in .env.deploy')
-  process.exit(1)
-}
+const { GetBalancesTool } = await import('../src/tools/get-balances.js')
+const { CreateDeploymentTool } = await import('../src/tools/create-deployment.js')
 
 const sdlPath = resolve(mcpRoot, '../service-cloud-api/deploy-api.yaml')
 let rawSDL = readFileSync(sdlPath, 'utf-8')
@@ -41,15 +34,24 @@ rawSDL = rawSDL
   .replace('__IPFS_API_URL__', process.env.IPFS_API_URL || '')
   .replace('__OTEL_ENDPOINT__', process.env.OTEL_EXPORTER_OTLP_ENDPOINT || '')
 
-console.log(`Updating API deployment (DSEQ ${API_DSEQ}) on provider ${API_PROVIDER}...`)
-console.log(`Image: ghcr.io/alternatefutures/service-cloud-api:latest`)
-
+console.log('Initializing wallet and certificate...')
 const { wallet, client, chainSDK } = await loadWalletAndClient()
 const certificate = await loadCertificate(wallet, client, chainSDK)
+const ctx = { wallet, client, certificate, chainSDK, reloadCertificate: async () => certificate }
 
-const result = await UpdateDeploymentTool.handler(
-  { rawSDL, dseq: API_DSEQ, provider: API_PROVIDER },
-  { wallet, client, certificate, chainSDK, reloadCertificate: async () => certificate }
+// Check balance first
+console.log('Checking wallet balance...')
+const balanceResult = await GetBalancesTool.handler({}, ctx)
+console.log('Balance:', JSON.stringify(balanceResult, null, 2))
+
+// Create deployment with 5 AKT deposit
+const deposit = 5000000 // 5 AKT in uakt
+console.log(`\nCreating API deployment with ${deposit / 1000000} AKT deposit...`)
+console.log(`Image: ghcr.io/alternatefutures/service-cloud-api:latest`)
+
+const result = await CreateDeploymentTool.handler(
+  { rawSDL, deposit, currency: 'uakt' },
+  ctx
 )
 
-console.log('Result:', JSON.stringify(result, null, 2))
+console.log('\nDeployment result:', JSON.stringify(result, null, 2))

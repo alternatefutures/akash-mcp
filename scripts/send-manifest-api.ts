@@ -1,8 +1,6 @@
 /**
- * Quick script to update the API deployment on Akash.
- * Uses akash-mcp internals (JS SDK, no CLI binary needed).
- *
- * Usage: npx tsx scripts/redeploy-api.ts
+ * Send manifest for the API deployment that already has a lease.
+ * Usage: npx tsx scripts/send-manifest-api.ts
  */
 
 import dotenv from 'dotenv'
@@ -17,20 +15,17 @@ dotenv.config({ path: resolve(mcpRoot, '.env.deploy') })
 
 const { loadWalletAndClient } = await import('../src/utils/load-wallet.js')
 const { loadCertificate } = await import('../src/utils/load-certificate.js')
-const { UpdateDeploymentTool } = await import('../src/tools/update-deployment.js')
+const { SendManifestTool } = await import('../src/tools/send-manifest.js')
 
-const API_DSEQ = Number(process.env.API_DSEQ)
-const API_PROVIDER = process.env.API_PROVIDER!
-
-if (!API_DSEQ || !API_PROVIDER) {
-  console.error('API_DSEQ and API_PROVIDER must be set in .env.deploy')
-  process.exit(1)
-}
+const DSEQ = 25585819
+const OWNER = 'akash1degudmhf24auhfnqtn99mkja3xt7clt9um77tn'
+const PROVIDER = 'akash1chnhnu50f6hv98xl0m7xm95vel457ysp32uwpj'
+const GSEQ = 1
+const OSEQ = 1
 
 const sdlPath = resolve(mcpRoot, '../service-cloud-api/deploy-api.yaml')
 let rawSDL = readFileSync(sdlPath, 'utf-8')
 
-// Substitute secrets from .env.deploy
 rawSDL = rawSDL
   .replace('__DATABASE_URL__', process.env.API_DATABASE_URL || process.env.DATABASE_URL || '')
   .replace('your_jwt_secret_min_32_chars_please_change_this_in_production', process.env.JWT_SECRET || '')
@@ -41,15 +36,16 @@ rawSDL = rawSDL
   .replace('__IPFS_API_URL__', process.env.IPFS_API_URL || '')
   .replace('__OTEL_ENDPOINT__', process.env.OTEL_EXPORTER_OTLP_ENDPOINT || '')
 
-console.log(`Updating API deployment (DSEQ ${API_DSEQ}) on provider ${API_PROVIDER}...`)
-console.log(`Image: ghcr.io/alternatefutures/service-cloud-api:latest`)
-
+console.log('Initializing wallet...')
 const { wallet, client, chainSDK } = await loadWalletAndClient()
 const certificate = await loadCertificate(wallet, client, chainSDK)
+const ctx = { wallet, client, certificate, chainSDK, reloadCertificate: async () => certificate }
 
-const result = await UpdateDeploymentTool.handler(
-  { rawSDL, dseq: API_DSEQ, provider: API_PROVIDER },
-  { wallet, client, certificate, chainSDK, reloadCertificate: async () => certificate }
+console.log(`Sending manifest for DSEQ ${DSEQ} to provider ${PROVIDER}...`)
+const result = await SendManifestTool.handler(
+  { sdl: rawSDL, owner: OWNER, dseq: DSEQ, gseq: GSEQ, oseq: OSEQ, provider: PROVIDER },
+  ctx
 )
 
-console.log('Result:', JSON.stringify(result, null, 2))
+const text = result.content[0].type === 'text' ? result.content[0].text : ''
+console.log('Result:', text)

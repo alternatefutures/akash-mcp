@@ -1,49 +1,35 @@
 /**
- * Check API deployment status to get forwarded ports
+ * Check API deployment status and get service URIs.
+ * Usage: npx tsx scripts/check-api-status.ts
  */
-import https from 'https';
-import { config } from 'dotenv';
-import { loadWalletAndClient } from '../src/utils/load-wallet.js';
-import { loadCertificate } from '../src/utils/load-certificate.js';
 
-config({ path: '.env' });
-config({ path: '.env.deploy' });
+import dotenv from 'dotenv'
+import { resolve, dirname } from 'path'
+import { fileURLToPath } from 'url'
 
-const DSEQ = 25474472; // API DSEQ from deployment
-const GSEQ = 1;
-const OSEQ = 1;
-const PROVIDER_HOST = 'provider.dal.leet.haus';
-const PROVIDER_PORT = 8443;
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const mcpRoot = resolve(__dirname, '..')
 
-async function main() {
-  const { wallet } = await loadWalletAndClient();
-  const cert = await loadCertificate(wallet);
+dotenv.config({ path: resolve(mcpRoot, '.env.deploy') })
 
-  const agent = new https.Agent({
-    cert: cert.cert,
-    key: cert.privateKey,
-    rejectUnauthorized: false,
-    servername: 'localhost'
-  });
+const { loadWalletAndClient } = await import('../src/utils/load-wallet.js')
+const { loadCertificate } = await import('../src/utils/load-certificate.js')
+const { GetServicesTool } = await import('../src/tools/get-services.js')
 
-  const status = await new Promise<any>((resolve, reject) => {
-    const req = https.request({
-      hostname: PROVIDER_HOST,
-      port: PROVIDER_PORT,
-      path: `/lease/${DSEQ}/${GSEQ}/${OSEQ}/status`,
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-      agent
-    }, res => {
-      let data = '';
-      res.on('data', (c: any) => data += c);
-      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(data); } });
-    });
-    req.on('error', reject);
-    req.end();
-  });
+const DSEQ = Number(process.env.API_DSEQ)
+const PROVIDER = process.env.API_PROVIDER!
+const OWNER = 'akash1degudmhf24auhfnqtn99mkja3xt7clt9um77tn'
 
-  console.log(JSON.stringify(status, null, 2));
-}
+console.log(`Checking DSEQ ${DSEQ} on ${PROVIDER}...`)
 
-main().catch(e => { console.error('FATAL:', e); process.exit(1); });
+const { wallet, client, chainSDK } = await loadWalletAndClient()
+const certificate = await loadCertificate(wallet, client, chainSDK)
+const ctx = { wallet, client, certificate, chainSDK, reloadCertificate: async () => certificate }
+
+const result = await GetServicesTool.handler(
+  { dseq: DSEQ, owner: OWNER, provider: PROVIDER, gseq: 1, oseq: 1 },
+  ctx
+)
+
+const text = result.content[0].type === 'text' ? result.content[0].text : ''
+console.log(JSON.stringify(JSON.parse(text), null, 2))
