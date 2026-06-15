@@ -12,9 +12,9 @@ const parameters = z.object({
 export const CreateDeploymentTool: ToolDefinition<typeof parameters> = {
   name: 'create-deployment',
   description:
-    'Create a new deployment on Akash Network using the provided SDL (Service Definition Language) string, deposit amount and currency.' +
-    'The deposit amount is the amount of tokens to deposit into the deployment.' +
-    'Minimum deposit amount is 500000 uakt.',
+    'Create a new deployment on Akash Network using the provided SDL (Service Definition Language) string, deposit amount and currency. ' +
+    'The deposit amount is the amount of tokens to deposit into the deployment. ' +
+    'Minimum deposit amount is 500000. Valid currencies: uakt (AKT) and uact (ACT, post-BME).',
   parameters,
   handler: async (params: z.infer<typeof parameters>, context: ToolContext) => {
     const { rawSDL } = params;
@@ -52,7 +52,7 @@ export const CreateDeploymentTool: ToolDefinition<typeof parameters> = {
             denom: params.currency,
             amount: params.deposit.toString(),
           },
-          sources: [1], // Source.balance = 1
+          sources: [2, 1], // Source.grant = 2, Source.balance = 1 (try authz grant first)
         },
       });
 

@@ -12,6 +12,11 @@ describe('CreateDeploymentTool', () => {
       expect(CreateDeploymentTool.description).toContain('SDL');
       expect(CreateDeploymentTool.description).toContain('deposit');
     });
+
+    it('should mention both uakt and uact currencies in description', () => {
+      expect(CreateDeploymentTool.description).toContain('uakt');
+      expect(CreateDeploymentTool.description).toContain('uact');
+    });
   });
 
   describe('parameter validation', () => {
@@ -21,8 +26,16 @@ describe('CreateDeploymentTool', () => {
       currency: 'uakt',
     };
 
-    it('should accept valid parameters', () => {
+    it('should accept valid parameters with uakt', () => {
       const result = CreateDeploymentTool.parameters.safeParse(validParams);
+      expect(result.success).toBe(true);
+    });
+
+    it('should accept valid parameters with uact (post-BME)', () => {
+      const result = CreateDeploymentTool.parameters.safeParse({
+        ...validParams,
+        currency: 'uact',
+      });
       expect(result.success).toBe(true);
     });
 

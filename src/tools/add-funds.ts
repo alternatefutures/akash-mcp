@@ -5,15 +5,16 @@ import { createOutput } from '../utils/create-output.js';
 const parameters = z.object({
   address: z.string().min(1, 'Akash account address is required'),
   dseq: z.number().int().positive(),
-  amount: z.string().min(1, 'Amount of uakt to add is required'),
+  amount: z.string().min(1, 'Amount to add is required'),
+  denom: z.string().default('uakt').describe('Token denomination: uakt (AKT) or uact (ACT, post-BME)'),
 });
 
 export const AddFundsTool: ToolDefinition<typeof parameters> = {
   name: 'add-funds',
-  description: 'Deposit additional AKT (uakt) into a deployment escrow account.',
+  description: 'Deposit additional tokens into a deployment escrow account. Supports uakt (AKT) and uact (ACT, post-BME).',
   parameters,
   handler: async (params, context) => {
-    const { address, dseq, amount } = params;
+    const { address, dseq, amount, denom } = params;
     const { chainSDK } = context;
 
     try {
@@ -39,8 +40,8 @@ export const AddFundsTool: ToolDefinition<typeof parameters> = {
           xid: `${address}/${dseq}`,
         },
         deposit: {
-          amount: { denom: 'uakt', amount: amount.toString() },
-          sources: [1], // Source.balance = 1
+          amount: { denom, amount: amount.toString() },
+          sources: [2, 1], // Source.grant = 2, Source.balance = 1 (try authz grant first)
         },
       });
 
